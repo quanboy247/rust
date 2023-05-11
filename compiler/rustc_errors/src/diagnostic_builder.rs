@@ -192,6 +192,7 @@ impl EmissionGuarantee for ErrorGuaranteed {
                      became non-error ({:?}), after original `.emit()`",
                     db.inner.diagnostic.level,
                 );
+                #[allow(deprecated)]
                 ErrorGuaranteed::unchecked_claim_error_was_emitted()
             }
         }
@@ -570,6 +571,14 @@ impl<'a, G: EmissionGuarantee> DiagnosticBuilder<'a, G> {
         Some((diagnostic, handler))
     }
 
+    /// Retrieves the [`Handler`] if available
+    pub fn handler(&self) -> Option<&Handler> {
+        match self.inner.state {
+            DiagnosticBuilderState::Emittable(handler) => Some(handler),
+            DiagnosticBuilderState::AlreadyEmittedOrDuringCancellation => None,
+        }
+    }
+
     /// Buffers the diagnostic for later emission,
     /// unless handler has disabled such buffering.
     pub fn buffer(self, buffered_diagnostics: &mut Vec<Diagnostic>) {
@@ -791,7 +800,7 @@ macro_rules! struct_span_err {
     ($session:expr, $span:expr, $code:ident, $($message:tt)*) => ({
         $session.struct_span_err_with_code(
             $span,
-            &format!($($message)*),
+            format!($($message)*),
             $crate::error_code!($code),
         )
     })

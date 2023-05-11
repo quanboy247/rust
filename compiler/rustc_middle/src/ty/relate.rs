@@ -7,7 +7,7 @@
 use crate::ty::error::{ExpectedFound, TypeError};
 use crate::ty::{self, Expr, ImplSubject, Term, TermKind, Ty, TyCtxt, TypeFoldable};
 use crate::ty::{GenericArg, GenericArgKind, SubstsRef};
-use rustc_hir as ast;
+use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_target::spec::abi;
 use std::iter;
@@ -123,8 +123,8 @@ pub fn relate_type_and_mut<'tcx, R: TypeRelation<'tcx>>(
     } else {
         let mutbl = a.mutbl;
         let (variance, info) = match mutbl {
-            ast::Mutability::Not => (ty::Covariant, ty::VarianceDiagInfo::None),
-            ast::Mutability::Mut => {
+            hir::Mutability::Not => (ty::Covariant, ty::VarianceDiagInfo::None),
+            hir::Mutability::Mut => {
                 (ty::Invariant, ty::VarianceDiagInfo::Invariant { ty: base_ty, param_index: 0 })
             }
         };
@@ -239,12 +239,12 @@ impl<'tcx> Relate<'tcx> for ty::BoundConstness {
     }
 }
 
-impl<'tcx> Relate<'tcx> for ast::Unsafety {
+impl<'tcx> Relate<'tcx> for hir::Unsafety {
     fn relate<R: TypeRelation<'tcx>>(
         relation: &mut R,
-        a: ast::Unsafety,
-        b: ast::Unsafety,
-    ) -> RelateResult<'tcx, ast::Unsafety> {
+        a: hir::Unsafety,
+        b: hir::Unsafety,
+    ) -> RelateResult<'tcx, hir::Unsafety> {
         if a != b {
             Err(TypeError::UnsafetyMismatch(expected_found(relation, a, b)))
         } else {
@@ -315,7 +315,7 @@ impl<'tcx> Relate<'tcx> for ty::TraitRef<'tcx> {
             Err(TypeError::Traits(expected_found(relation, a.def_id, b.def_id)))
         } else {
             let substs = relate_substs(relation, a.substs, b.substs)?;
-            Ok(relation.tcx().mk_trait_ref(a.def_id, substs))
+            Ok(ty::TraitRef::new(relation.tcx(), a.def_id, substs))
         }
     }
 }
@@ -548,6 +548,11 @@ pub fn super_relate_tys<'tcx, R: TypeRelation<'tcx>>(
         (&ty::Alias(ty::Projection, a_data), &ty::Alias(ty::Projection, b_data)) => {
             let projection_ty = relation.relate(a_data, b_data)?;
             Ok(tcx.mk_projection(projection_ty.def_id, projection_ty.substs))
+        }
+
+        (&ty::Alias(ty::Inherent, a_data), &ty::Alias(ty::Inherent, b_data)) => {
+            let alias_ty = relation.relate(a_data, b_data)?;
+            Ok(tcx.mk_alias(ty::Inherent, tcx.mk_alias_ty(alias_ty.def_id, alias_ty.substs)))
         }
 
         (

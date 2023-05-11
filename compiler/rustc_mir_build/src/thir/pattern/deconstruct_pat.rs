@@ -52,7 +52,7 @@ use smallvec::{smallvec, SmallVec};
 
 use rustc_data_structures::captures::Captures;
 use rustc_hir::{HirId, RangeEnd};
-use rustc_index::vec::Idx;
+use rustc_index::Idx;
 use rustc_middle::mir;
 use rustc_middle::thir::{FieldPat, Pat, PatKind, PatRange};
 use rustc_middle::ty::layout::IntegerExt;
@@ -258,7 +258,7 @@ impl IntRange {
         pcx: &PatCtxt<'_, 'p, 'tcx>,
         pats: impl Iterator<Item = &'a DeconstructedPat<'p, 'tcx>>,
         column_count: usize,
-        hir_id: HirId,
+        lint_root: HirId,
     ) {
         if self.is_singleton() {
             return;
@@ -290,7 +290,7 @@ impl IntRange {
         if !overlap.is_empty() {
             pcx.cx.tcx.emit_spanned_lint(
                 lint::builtin::OVERLAPPING_RANGE_ENDPOINTS,
-                hir_id,
+                lint_root,
                 pcx.span,
                 OverlappingRangeEndpoints { overlap, range: pcx.span },
             );

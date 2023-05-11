@@ -115,7 +115,7 @@ impl<'tcx> TraitAliasExpander<'tcx> {
         }
 
         // Get components of trait alias.
-        let predicates = tcx.super_predicates_of(trait_ref.def_id());
+        let predicates = tcx.implied_predicates_of(trait_ref.def_id());
         debug!(?predicates);
 
         let items = predicates.predicates.iter().rev().filter_map(|(pred, span)| {
@@ -197,8 +197,9 @@ pub fn impl_subject_and_oblig<'a, 'tcx>(
     param_env: ty::ParamEnv<'tcx>,
     impl_def_id: DefId,
     impl_substs: SubstsRef<'tcx>,
+    cause: impl Fn(usize, Span) -> ObligationCause<'tcx>,
 ) -> (ImplSubject<'tcx>, impl Iterator<Item = PredicateObligation<'tcx>>) {
-    let subject = selcx.tcx().bound_impl_subject(impl_def_id);
+    let subject = selcx.tcx().impl_subject(impl_def_id);
     let subject = subject.subst(selcx.tcx(), impl_substs);
 
     let InferOk { value: subject, obligations: normalization_obligations1 } =
@@ -208,8 +209,7 @@ pub fn impl_subject_and_oblig<'a, 'tcx>(
     let predicates = predicates.instantiate(selcx.tcx(), impl_substs);
     let InferOk { value: predicates, obligations: normalization_obligations2 } =
         selcx.infcx.at(&ObligationCause::dummy(), param_env).normalize(predicates);
-    let impl_obligations =
-        super::predicates_for_generics(|_, _| ObligationCause::dummy(), param_env, predicates);
+    let impl_obligations = super::predicates_for_generics(cause, param_env, predicates);
 
     let impl_obligations = impl_obligations
         .chain(normalization_obligations1.into_iter())
@@ -243,16 +243,11 @@ pub fn get_vtable_index_of_object_method<'tcx, N>(
 ) -> Option<usize> {
     // Count number of methods preceding the one we are selecting and
     // add them to the total offset.
-    if let Some(index) = tcx
-        .own_existential_vtable_entries(object.upcast_trait_ref.def_id())
+    tcx.own_existential_vtable_entries(object.upcast_trait_ref.def_id())
         .iter()
         .copied()
         .position(|def_id| def_id == method_def_id)
-    {
-        Some(object.vtable_base + index)
-    } else {
-        None
-    }
+        .map(|index| object.vtable_base + index)
 }
 
 pub fn closure_trait_ref_and_return_type<'tcx>(
@@ -267,7 +262,7 @@ pub fn closure_trait_ref_and_return_type<'tcx>(
         TupleArgumentsFlag::No => sig.skip_binder().inputs()[0],
         TupleArgumentsFlag::Yes => tcx.mk_tup(sig.skip_binder().inputs()),
     };
-    let trait_ref = tcx.mk_trait_ref(fn_trait_def_id, [self_ty, arguments_tuple]);
+    let trait_ref = ty::TraitRef::new(tcx, fn_trait_def_id, [self_ty, arguments_tuple]);
     sig.map_bound(|sig| (trait_ref, sig.output()))
 }
 
@@ -278,7 +273,7 @@ pub fn generator_trait_ref_and_outputs<'tcx>(
     sig: ty::PolyGenSig<'tcx>,
 ) -> ty::Binder<'tcx, (ty::TraitRef<'tcx>, Ty<'tcx>, Ty<'tcx>)> {
     assert!(!self_ty.has_escaping_bound_vars());
-    let trait_ref = tcx.mk_trait_ref(fn_trait_def_id, [self_ty, sig.skip_binder().resume_ty]);
+    let trait_ref = ty::TraitRef::new(tcx, fn_trait_def_id, [self_ty, sig.skip_binder().resume_ty]);
     sig.map_bound(|sig| (trait_ref, sig.yield_ty, sig.return_ty))
 }
 
@@ -289,7 +284,7 @@ pub fn future_trait_ref_and_outputs<'tcx>(
     sig: ty::PolyGenSig<'tcx>,
 ) -> ty::Binder<'tcx, (ty::TraitRef<'tcx>, Ty<'tcx>)> {
     assert!(!self_ty.has_escaping_bound_vars());
-    let trait_ref = tcx.mk_trait_ref(fn_trait_def_id, [self_ty]);
+    let trait_ref = ty::TraitRef::new(tcx, fn_trait_def_id, [self_ty]);
     sig.map_bound(|sig| (trait_ref, sig.return_ty))
 }
 

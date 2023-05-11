@@ -6,7 +6,6 @@
 #![feature(array_windows)]
 #![feature(drain_filter)]
 #![feature(if_let_guard)]
-#![feature(is_terminal)]
 #![feature(adt_const_params)]
 #![feature(let_chains)]
 #![feature(never_type)]
@@ -32,15 +31,15 @@ use Level::*;
 use emitter::{is_case_difference, Emitter, EmitterWriter};
 use registry::Registry;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet};
-use rustc_data_structures::stable_hasher::StableHasher;
+use rustc_data_structures::stable_hasher::{Hash128, StableHasher};
 use rustc_data_structures::sync::{self, Lock, Lrc};
 use rustc_data_structures::AtomicRef;
 pub use rustc_error_messages::{
     fallback_fluent_bundle, fluent_bundle, DelayDm, DiagnosticMessage, FluentBundle,
     LanguageIdentifier, LazyFallbackBundle, MultiSpan, SpanLabel, SubdiagnosticMessage,
 };
+use rustc_fluent_macro::fluent_messages;
 pub use rustc_lint_defs::{pluralize, Applicability};
-use rustc_macros::fluent_messages;
 use rustc_span::source_map::SourceMap;
 pub use rustc_span::ErrorGuaranteed;
 use rustc_span::{Loc, Span};
@@ -383,7 +382,9 @@ pub use diagnostic::{
     DiagnosticStyledString, IntoDiagnosticArg, SubDiagnostic,
 };
 pub use diagnostic_builder::{DiagnosticBuilder, EmissionGuarantee, Noted};
-pub use diagnostic_impls::{DiagnosticArgFromDisplay, DiagnosticSymbolList};
+pub use diagnostic_impls::{
+    DiagnosticArgFromDisplay, DiagnosticSymbolList, LabelKind, SingleLabelManySpans,
+};
 use std::backtrace::Backtrace;
 
 /// A handler deals with errors and other compiler output.
@@ -426,7 +427,7 @@ struct HandlerInner {
     /// This set contains a hash of every diagnostic that has been emitted by
     /// this handler. These hashes is used to avoid emitting the same error
     /// twice.
-    emitted_diagnostics: FxHashSet<u128>,
+    emitted_diagnostics: FxHashSet<Hash128>,
 
     /// Stashed diagnostics emitted in one stage of the compiler that may be
     /// stolen by other stages (e.g. to improve them and add more information).
@@ -473,8 +474,6 @@ pub enum StashKey {
     /// When an invalid lifetime e.g. `'2` should be reinterpreted
     /// as a char literal in the parser
     LifetimeIsChar,
-    /// When an invalid lifetime e.g. `'🐱` contains emoji.
-    LifetimeContainsEmoji,
     /// Maybe there was a typo where a comma was forgotten before
     /// FRU syntax
     MaybeFruTypo,
@@ -1070,26 +1069,29 @@ impl Handler {
     }
 
     pub fn has_errors(&self) -> Option<ErrorGuaranteed> {
-        self.inner.borrow().has_errors().then(ErrorGuaranteed::unchecked_claim_error_was_emitted)
+        self.inner.borrow().has_errors().then(|| {
+            #[allow(deprecated)]
+            ErrorGuaranteed::unchecked_claim_error_was_emitted()
+        })
     }
 
     pub fn has_errors_or_lint_errors(&self) -> Option<ErrorGuaranteed> {
-        self.inner
-            .borrow()
-            .has_errors_or_lint_errors()
-            .then(ErrorGuaranteed::unchecked_claim_error_was_emitted)
+        self.inner.borrow().has_errors_or_lint_errors().then(|| {
+            #[allow(deprecated)]
+            ErrorGuaranteed::unchecked_claim_error_was_emitted()
+        })
     }
     pub fn has_errors_or_delayed_span_bugs(&self) -> Option<ErrorGuaranteed> {
-        self.inner
-            .borrow()
-            .has_errors_or_delayed_span_bugs()
-            .then(ErrorGuaranteed::unchecked_claim_error_was_emitted)
+        self.inner.borrow().has_errors_or_delayed_span_bugs().then(|| {
+            #[allow(deprecated)]
+            ErrorGuaranteed::unchecked_claim_error_was_emitted()
+        })
     }
     pub fn is_compilation_going_to_fail(&self) -> Option<ErrorGuaranteed> {
-        self.inner
-            .borrow()
-            .is_compilation_going_to_fail()
-            .then(ErrorGuaranteed::unchecked_claim_error_was_emitted)
+        self.inner.borrow().is_compilation_going_to_fail().then(|| {
+            #[allow(deprecated)]
+            ErrorGuaranteed::unchecked_claim_error_was_emitted()
+        })
     }
 
     pub fn print_error_count(&self, registry: &Registry) {
@@ -1334,6 +1336,7 @@ impl HandlerInner {
                 .push(DelayedDiagnostic::with_backtrace(diagnostic.clone(), backtrace));
 
             if !self.flags.report_delayed_bugs {
+                #[allow(deprecated)]
                 return Some(ErrorGuaranteed::unchecked_claim_error_was_emitted());
             }
         }
@@ -1412,7 +1415,10 @@ impl HandlerInner {
                     self.bump_err_count();
                 }
 
-                guaranteed = Some(ErrorGuaranteed::unchecked_claim_error_was_emitted());
+                #[allow(deprecated)]
+                {
+                    guaranteed = Some(ErrorGuaranteed::unchecked_claim_error_was_emitted());
+                }
             } else {
                 self.bump_warn_count();
             }
@@ -1463,10 +1469,10 @@ impl HandlerInner {
                 DiagnosticMessage::Str(warnings),
             )),
             (_, 0) => {
-                let _ = self.fatal(&errors);
+                let _ = self.fatal(errors);
             }
             (_, _) => {
-                let _ = self.fatal(&format!("{}; {}", &errors, &warnings));
+                let _ = self.fatal(format!("{}; {}", &errors, &warnings));
             }
         }
 
@@ -1487,18 +1493,18 @@ impl HandlerInner {
                 error_codes.sort();
                 if error_codes.len() > 1 {
                     let limit = if error_codes.len() > 9 { 9 } else { error_codes.len() };
-                    self.failure(&format!(
+                    self.failure(format!(
                         "Some errors have detailed explanations: {}{}",
                         error_codes[..limit].join(", "),
                         if error_codes.len() > 9 { "..." } else { "." }
                     ));
-                    self.failure(&format!(
+                    self.failure(format!(
                         "For more information about an error, try \
                          `rustc --explain {}`.",
                         &error_codes[0]
                     ));
                 } else {
-                    self.failure(&format!(
+                    self.failure(format!(
                         "For more information about this error, try \
                          `rustc --explain {}`.",
                         &error_codes[0]
@@ -1664,7 +1670,7 @@ impl HandlerInner {
             if bug.level != Level::DelayedBug {
                 // NOTE(eddyb) not panicking here because we're already producing
                 // an ICE, and the more information the merrier.
-                bug.note(&format!(
+                bug.note(format!(
                     "`flushed_delayed` got diagnostic with level {:?}, \
                      instead of the expected `DelayedBug`",
                     bug.level,
@@ -1733,7 +1739,7 @@ impl DelayedDiagnostic {
     }
 
     fn decorate(mut self) -> Diagnostic {
-        self.inner.note(&format!("delayed at {}", self.note));
+        self.inner.note(format!("delayed at {}", self.note));
         self.inner
     }
 }
@@ -1832,7 +1838,7 @@ pub fn add_elided_lifetime_in_path_suggestion(
         if incl_angl_brckt { format!("<{}>", anon_lts) } else { format!("{}, ", anon_lts) };
     diag.span_suggestion_verbose(
         insertion_span.shrink_to_hi(),
-        &format!("indicate the anonymous lifetime{}", pluralize!(n)),
+        format!("indicate the anonymous lifetime{}", pluralize!(n)),
         suggestion,
         Applicability::MachineApplicable,
     );

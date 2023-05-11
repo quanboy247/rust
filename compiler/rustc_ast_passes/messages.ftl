@@ -17,9 +17,10 @@ ast_passes_keyword_lifetime =
 ast_passes_invalid_label =
     invalid label name `{$name}`
 
-ast_passes_invalid_visibility =
-    unnecessary visibility qualifier
-    .implied = `pub` not permitted here because it's implied
+ast_passes_visibility_not_permitted =
+    visibility qualifiers are not permitted here
+    .enum_variant = enum variants and their fields always share the visibility of the enum they are in
+    .trait_impl = trait items always share the visibility of their trait
     .individual_impl_items = place qualifiers on individual impl items instead
     .individual_foreign_items = place qualifiers on individual foreign items instead
 
@@ -205,7 +206,7 @@ ast_passes_tilde_const_disallowed = `~const` is not allowed here
     .closure = closures cannot have `~const` trait bounds
     .function = this function is not `const`, so it cannot have `~const` trait bounds
 
-ast_passes_optional_const_exclusive = `~const` and `?` are mutually exclusive
+ast_passes_optional_const_exclusive = `~const` and `{$modifier}` are mutually exclusive
 
 ast_passes_const_and_async = functions cannot be both `const` and `async`
     .const = `const` because of this
@@ -230,7 +231,13 @@ ast_passes_feature_on_non_nightly = `#![feature]` may not be used on the {$chann
     .suggestion = remove the attribute
     .stable_since = the feature `{$name}` has been stable since `{$since}` and no longer requires an attribute to enable
 
-ast_passes_incompatbile_features = `{$f1}` and `{$f2}` are incompatible, using them at the same time is not allowed
+ast_passes_incompatible_features = `{$f1}` and `{$f2}` are incompatible, using them at the same time is not allowed
     .help = remove one of these features
 
 ast_passes_show_span = {$msg}
+
+ast_passes_negative_bound_not_supported =
+    negative bounds are not supported
+
+ast_passes_constraint_on_negative_bound =
+    associated type constraints not allowed on negative bounds

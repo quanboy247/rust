@@ -192,6 +192,14 @@ macro_rules! make_mir_visitor {
                 self.super_constant(constant, location);
             }
 
+            fn visit_ty_const(
+                &mut self,
+                ct: $( & $mutability)? ty::Const<'tcx>,
+                location: Location,
+            ) {
+                self.super_ty_const(ct, location);
+            }
+
             fn visit_span(
                 &mut self,
                 span: $(& $mutability)? Span,
@@ -410,7 +418,7 @@ macro_rules! make_mir_visitor {
                     StatementKind::PlaceMention(place) => {
                         self.visit_place(
                             place,
-                            PlaceContext::NonUse(NonUseContext::PlaceMention),
+                            PlaceContext::NonMutatingUse(NonMutatingUseContext::PlaceMention),
                             location
                         );
                     }
@@ -462,7 +470,7 @@ macro_rules! make_mir_visitor {
                 match kind {
                     TerminatorKind::Goto { .. } |
                     TerminatorKind::Resume |
-                    TerminatorKind::Abort |
+                    TerminatorKind::Terminate |
                     TerminatorKind::GeneratorDrop |
                     TerminatorKind::Unreachable |
                     TerminatorKind::FalseEdge { .. } |
@@ -509,7 +517,7 @@ macro_rules! make_mir_visitor {
                         args,
                         destination,
                         target: _,
-                        cleanup: _,
+                        unwind: _,
                         from_hir_call: _,
                         fn_span: _
                     } => {
@@ -529,7 +537,7 @@ macro_rules! make_mir_visitor {
                         expected: _,
                         msg,
                         target: _,
-                        cleanup: _,
+                        unwind: _,
                     } => {
                         self.visit_operand(cond, location);
                         self.visit_assert_message(msg, location);
@@ -555,7 +563,7 @@ macro_rules! make_mir_visitor {
                         options: _,
                         line_spans: _,
                         destination: _,
-                        cleanup: _,
+                        unwind: _,
                     } => {
                         for op in operands {
                             match op {
@@ -625,8 +633,9 @@ macro_rules! make_mir_visitor {
                         self.visit_operand(operand, location);
                     }
 
-                    Rvalue::Repeat(value, _) => {
+                    Rvalue::Repeat(value, ct) => {
                         self.visit_operand(value, location);
+                        self.visit_ty_const($(&$mutability)? *ct, location);
                     }
 
                     Rvalue::ThreadLocalRef(_) => {}
@@ -832,6 +841,7 @@ macro_rules! make_mir_visitor {
                     name: _,
                     source_info,
                     value,
+                    argument_index: _,
                 } = var_debug_info;
 
                 self.visit_source_info(source_info);
@@ -877,10 +887,18 @@ macro_rules! make_mir_visitor {
                 self.visit_span($(& $mutability)? *span);
                 drop(user_ty); // no visit method for this
                 match literal {
-                    ConstantKind::Ty(_) => {}
+                    ConstantKind::Ty(ct) => self.visit_ty_const($(&$mutability)? *ct, location),
                     ConstantKind::Val(_, ty) => self.visit_ty($(& $mutability)? *ty, TyContext::Location(location)),
                     ConstantKind::Unevaluated(_, ty) => self.visit_ty($(& $mutability)? *ty, TyContext::Location(location)),
                 }
+            }
+
+            fn super_ty_const(
+                &mut self,
+                _ct: $(& $mutability)? ty::Const<'tcx>,
+                _location: Location,
+            ) {
+
             }
 
             fn super_span(&mut self, _span: $(& $mutability)? Span) {
@@ -1250,6 +1268,11 @@ pub enum NonMutatingUseContext {
     UniqueBorrow,
     /// AddressOf for *const pointer.
     AddressOf,
+    /// PlaceMention statement.
+    ///
+    /// This statement is executed as a check that the `Place` is live without reading from it,
+    /// so it must be considered as a non-mutating use.
+    PlaceMention,
     /// Used as base for another place, e.g., `x` in `x.y`. Will not mutate the place.
     /// For example, the projection `x.y` is not marked as a mutation in these cases:
     /// ```ignore (illustrative)
@@ -1300,8 +1323,6 @@ pub enum NonUseContext {
     AscribeUserTy,
     /// The data of a user variable, for debug info.
     VarDebugInfo,
-    /// PlaceMention statement.
-    PlaceMention,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

@@ -1,5 +1,5 @@
 use crate::errors::{
-    MultipleWhereClauses, UnexpectedDefaultValueForLifetimeInGenericParameters,
+    self, MultipleWhereClauses, UnexpectedDefaultValueForLifetimeInGenericParameters,
     UnexpectedSelfInGenericParameters, WhereClauseBeforeTupleStructBody,
     WhereClauseBeforeTupleStructBodySugg,
 };
@@ -53,7 +53,7 @@ impl<'a> Parser<'a> {
                 let snapshot = self.create_snapshot_for_diagnostic();
                 match self.parse_ty() {
                     Ok(p) => {
-                        if let TyKind::ImplTrait(_, bounds) = &(*p).kind {
+                        if let TyKind::ImplTrait(_, bounds) = &p.kind {
                             let span = impl_span.to(self.token.span.shrink_to_lo());
                             let mut err = self.struct_span_err(
                                 span,
@@ -78,7 +78,7 @@ impl<'a> Parser<'a> {
                 }
                 self.restore_snapshot(snapshot);
             }
-            self.parse_generic_bounds(colon_span)?
+            self.parse_generic_bounds()?
         } else {
             Vec::new()
         };
@@ -181,12 +181,9 @@ impl<'a> Parser<'a> {
                         let snapshot = this.create_snapshot_for_diagnostic();
                         match this.parse_ty_where_predicate() {
                             Ok(where_predicate) => {
-                                this.struct_span_err(
-                                    where_predicate.span(),
-                                    "bounds on associated types do not belong here",
-                                )
-                                .span_label(where_predicate.span(), "belongs in `where` clause")
-                                .emit();
+                                this.sess.emit_err(errors::BadAssocTypeBounds {
+                                    span: where_predicate.span(),
+                                });
                                 // FIXME - try to continue parsing other generics?
                                 return Ok((None, TrailingToken::None));
                             }
@@ -201,22 +198,11 @@ impl<'a> Parser<'a> {
                         // Check for trailing attributes and stop parsing.
                         if !attrs.is_empty() {
                             if !params.is_empty() {
-                                this.struct_span_err(
-                                    attrs[0].span,
-                                    "trailing attribute after generic parameter",
-                                )
-                                .span_label(attrs[0].span, "attributes must go before parameters")
-                                .emit();
+                                this.sess
+                                    .emit_err(errors::AttrAfterGeneric { span: attrs[0].span });
                             } else {
-                                this.struct_span_err(
-                                    attrs[0].span,
-                                    "attribute without generic parameters",
-                                )
-                                .span_label(
-                                    attrs[0].span,
-                                    "attributes are only permitted when preceding parameters",
-                                )
-                                .emit();
+                                this.sess
+                                    .emit_err(errors::AttrWithoutGenerics { span: attrs[0].span });
                             }
                         }
                         return Ok((None, TrailingToken::None));
@@ -304,12 +290,7 @@ impl<'a> Parser<'a> {
         // change we parse those generics now, but report an error.
         if self.choose_generics_over_qpath(0) {
             let generics = self.parse_generics()?;
-            self.struct_span_err(
-                generics.span,
-                "generic parameters on `where` clauses are reserved for future use",
-            )
-            .span_label(generics.span, "currently unsupported")
-            .emit();
+            self.sess.emit_err(errors::WhereOnGenerics { span: generics.span });
         }
 
         loop {
@@ -438,7 +419,7 @@ impl<'a> Parser<'a> {
         // or with mandatory equality sign and the second type.
         let ty = self.parse_ty_for_where_clause()?;
         if self.eat(&token::Colon) {
-            let bounds = self.parse_generic_bounds(Some(self.prev_token.span))?;
+            let bounds = self.parse_generic_bounds()?;
             Ok(ast::WherePredicate::BoundPredicate(ast::WhereBoundPredicate {
                 span: lo.to(self.prev_token.span),
                 bound_generic_params: lifetime_defs,

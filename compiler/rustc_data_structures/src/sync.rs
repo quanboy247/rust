@@ -7,9 +7,6 @@
 //! while the serial versions degenerate straightforwardly to serial execution.
 //! The operations include `join`, `parallel`, `par_iter`, and `par_for_each`.
 //!
-//! `rustc_erase_owner!` erases an `OwningRef` owner into `Erased` for the
-//! serial version and `Erased + Send + Sync` for the parallel version.
-//!
 //! Types
 //! -----
 //! The parallel versions of types provide various kinds of synchronization,
@@ -42,33 +39,29 @@
 //!
 //! [^2] `MTLockRef` is a typedef.
 
-use crate::owning_ref::{Erased, OwningRef};
+use crate::owned_slice::OwnedSlice;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
 use std::ops::{Deref, DerefMut};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
+mod worker_local;
+pub use worker_local::{Registry, WorkerLocal};
+
 pub use std::sync::atomic::Ordering;
 pub use std::sync::atomic::Ordering::SeqCst;
 
-pub use vec::AppendOnlyVec;
+pub use vec::{AppendOnlyIndexVec, AppendOnlyVec};
 
 mod vec;
 
 cfg_if! {
     if #[cfg(not(parallel_compiler))] {
-        pub auto trait Send {}
-        pub auto trait Sync {}
+        pub unsafe auto trait Send {}
+        pub unsafe auto trait Sync {}
 
-        impl<T> Send for T {}
-        impl<T> Sync for T {}
-
-        #[macro_export]
-        macro_rules! rustc_erase_owner {
-            ($v:expr) => {
-                $v.erase_owner()
-            }
-        }
+        unsafe impl<T> Send for T {}
+        unsafe impl<T> Sync for T {}
 
         use std::ops::Add;
 
@@ -104,6 +97,14 @@ cfg_if! {
             #[inline]
             pub fn swap(&self, val: T, _: Ordering) -> T {
                 self.0.replace(val)
+            }
+        }
+
+        impl Atomic<bool> {
+            pub fn fetch_or(&self, val: bool, _: Ordering) -> bool {
+                let result = self.0.get() | val;
+                self.0.set(val);
+                result
             }
         }
 
@@ -189,7 +190,7 @@ cfg_if! {
             }
         }
 
-        pub type MetadataRef = OwningRef<Box<dyn Erased>, [u8]>;
+        pub type MetadataRef = OwnedSlice;
 
         pub use std::rc::Rc as Lrc;
         pub use std::rc::Weak as Weak;
@@ -206,33 +207,6 @@ cfg_if! {
         use std::cell::RefCell as InnerLock;
 
         use std::cell::Cell;
-
-        #[derive(Debug)]
-        pub struct WorkerLocal<T>(OneThread<T>);
-
-        impl<T> WorkerLocal<T> {
-            /// Creates a new worker local where the `initial` closure computes the
-            /// value this worker local should take for each thread in the thread pool.
-            #[inline]
-            pub fn new<F: FnMut(usize) -> T>(mut f: F) -> WorkerLocal<T> {
-                WorkerLocal(OneThread::new(f(0)))
-            }
-
-            /// Returns the worker-local value for each thread
-            #[inline]
-            pub fn into_inner(self) -> Vec<T> {
-                vec![OneThread::into_inner(self.0)]
-            }
-        }
-
-        impl<T> Deref for WorkerLocal<T> {
-            type Target = T;
-
-            #[inline(always)]
-            fn deref(&self) -> &T {
-                &self.0
-            }
-        }
 
         pub type MTLockRef<'a, T> = &'a mut MTLock<T>;
 
@@ -353,8 +327,6 @@ cfg_if! {
             };
         }
 
-        pub use rayon_core::WorkerLocal;
-
         pub use rayon::iter::ParallelIterator;
         use rayon::iter::IntoParallelIterator;
 
@@ -372,20 +344,11 @@ cfg_if! {
             });
         }
 
-        pub type MetadataRef = OwningRef<Box<dyn Erased + Send + Sync>, [u8]>;
+        pub type MetadataRef = OwnedSlice;
 
         /// This makes locks panic if they are already held.
         /// It is only useful when you are running in a single thread
         const ERROR_CHECKING: bool = false;
-
-        #[macro_export]
-        macro_rules! rustc_erase_owner {
-            ($v:expr) => {{
-                let v = $v;
-                ::rustc_data_structures::sync::assert_send_val(&v);
-                v.erase_send_sync_owner()
-            }}
-        }
     }
 }
 
@@ -393,6 +356,10 @@ pub fn assert_sync<T: ?Sized + Sync>() {}
 pub fn assert_send<T: ?Sized + Send>() {}
 pub fn assert_send_val<T: ?Sized + Send>(_t: &T) {}
 pub fn assert_send_sync_val<T: ?Sized + Sync + Send>(_t: &T) {}
+
+#[derive(Default)]
+#[cfg_attr(parallel_compiler, repr(align(64)))]
+pub struct CacheAligned<T>(pub T);
 
 pub trait HashMapExt<K, V> {
     /// Same as HashMap::insert, but it may panic if there's already an
@@ -478,14 +445,6 @@ impl<T: Default> Default for Lock<T> {
     #[inline]
     fn default() -> Self {
         Lock::new(T::default())
-    }
-}
-
-// FIXME: Probably a bad idea
-impl<T: Clone> Clone for Lock<T> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Lock::new(self.borrow().clone())
     }
 }
 

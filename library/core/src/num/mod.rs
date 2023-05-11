@@ -225,6 +225,23 @@ macro_rules! widening_impl {
     };
 }
 
+macro_rules! conv_rhs_for_unchecked_shift {
+    ($SelfT:ty, $x:expr) => {{
+        #[inline]
+        fn conv(x: u32) -> $SelfT {
+            // FIXME(const-hack) replace with `.try_into().ok().unwrap_unchecked()`.
+            // SAFETY: Any legal shift amount must be losslessly representable in the self type.
+            unsafe { x.try_into().ok().unwrap_unchecked() }
+        }
+        #[inline]
+        const fn const_conv(x: u32) -> $SelfT {
+            x as _
+        }
+
+        intrinsics::const_eval_select(($x,), const_conv, conv)
+    }};
+}
+
 impl i8 {
     int_impl! {
         Self = i8,
@@ -455,7 +472,16 @@ impl u8 {
     #[rustc_const_stable(feature = "const_u8_is_ascii", since = "1.43.0")]
     #[inline]
     pub const fn is_ascii(&self) -> bool {
-        *self & 128 == 0
+        *self <= 127
+    }
+
+    /// If the value of this byte is within the ASCII range, returns it as an
+    /// [ASCII character](ascii::Char).  Otherwise, returns `None`.
+    #[must_use]
+    #[unstable(feature = "ascii_char", issue = "110998")]
+    #[inline]
+    pub const fn as_ascii(&self) -> Option<ascii::Char> {
+        ascii::Char::from_u8(*self)
     }
 
     /// Makes a copy of the value in its ASCII upper case equivalent.

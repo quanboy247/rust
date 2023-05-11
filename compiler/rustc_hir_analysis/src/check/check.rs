@@ -15,7 +15,7 @@ use rustc_infer::infer::opaque_types::ConstrainOpaqueTypeRegionVisitor;
 use rustc_infer::infer::outlives::env::OutlivesEnvironment;
 use rustc_infer::infer::{DefiningAnchor, RegionVariableOrigin, TyCtxtInferExt};
 use rustc_infer::traits::{Obligation, TraitEngineExt as _};
-use rustc_lint::builtin::REPR_TRANSPARENT_EXTERNAL_PRIVATE_FIELDS;
+use rustc_lint_defs::builtin::REPR_TRANSPARENT_EXTERNAL_PRIVATE_FIELDS;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::stability::EvalResult;
 use rustc_middle::ty::layout::{LayoutError, MAX_SIMD_LANES};
@@ -170,14 +170,12 @@ fn check_static_inhabited(tcx: TyCtxt<'_>, def_id: LocalDefId) {
             if matches!(tcx.def_kind(def_id), DefKind::Static(_)
                 if tcx.def_kind(tcx.local_parent(def_id)) == DefKind::ForeignMod) =>
         {
-            tcx.sess
-                .struct_span_err(span, "extern static is too large for the current architecture")
-                .emit();
+            tcx.sess.emit_err(errors::TooLargeStatic { span });
             return;
         }
         // Generic statics are rejected, but we still reach this case.
         Err(e) => {
-            tcx.sess.delay_span_bug(span, &e.to_string());
+            tcx.sess.delay_span_bug(span, e.to_string());
             return;
         }
     };
@@ -320,7 +318,7 @@ pub(super) fn check_opaque_for_inheriting_lifetimes(
         };
         let prohibit_opaque = tcx
             .explicit_item_bounds(def_id)
-            .iter()
+            .subst_identity_iter_copied()
             .try_for_each(|(predicate, _)| predicate.visit_with(&mut visitor));
 
         if let Some(ty) = prohibit_opaque.break_value() {
@@ -336,7 +334,7 @@ pub(super) fn check_opaque_for_inheriting_lifetimes(
                 &tcx.sess.parse_sess,
                 sym::impl_trait_projections,
                 span,
-                &format!(
+                format!(
                     "`{}` return type cannot contain a projection or `Self` that references \
                     lifetimes from a parent scope",
                     if is_async { "async fn" } else { "impl Trait" },
@@ -430,7 +428,7 @@ fn check_opaque_meets_bounds<'tcx>(
             let ty_err = ty_err.to_string(tcx);
             tcx.sess.delay_span_bug(
                 span,
-                &format!("could not unify `{hidden_ty}` with revealed type:\n{ty_err}"),
+                format!("could not unify `{hidden_ty}` with revealed type:\n{ty_err}"),
             );
         }
     }
@@ -452,11 +450,8 @@ fn check_opaque_meets_bounds<'tcx>(
         hir::OpaqueTyOrigin::FnReturn(..) | hir::OpaqueTyOrigin::AsyncFn(..) => {}
         // Can have different predicates to their defining use
         hir::OpaqueTyOrigin::TyAlias => {
-            let outlives_environment = OutlivesEnvironment::new(param_env);
-            let _ = infcx.err_ctxt().check_region_obligations_and_report_errors(
-                defining_use_anchor,
-                &outlives_environment,
-            );
+            let outlives_env = OutlivesEnvironment::new(param_env);
+            let _ = ocx.resolve_regions_and_report_errors(defining_use_anchor, &outlives_env);
         }
     }
     // Clean up after ourselves
@@ -497,7 +492,7 @@ fn check_item_type(tcx: TyCtxt<'_>, id: hir::ItemId) {
     debug!(
         "check_item_type(it.def_id={:?}, it.name={})",
         id.owner_id,
-        tcx.def_path_str(id.owner_id.to_def_id())
+        tcx.def_path_str(id.owner_id)
     );
     let _indenter = indenter();
     match tcx.def_kind(id.owner_id) {
@@ -541,7 +536,7 @@ fn check_item_type(tcx: TyCtxt<'_>, id: hir::ItemId) {
                             tcx,
                             assoc_item,
                             assoc_item,
-                            tcx.mk_trait_ref(id.owner_id.to_def_id(), trait_substs),
+                            ty::TraitRef::new(tcx, id.owner_id.to_def_id(), trait_substs),
                         );
                     }
                     _ => {}
@@ -623,11 +618,11 @@ fn check_item_type(tcx: TyCtxt<'_>, id: hir::ItemId) {
                                 E0044,
                                 "foreign items may not have {kinds} parameters",
                             )
-                            .span_label(item.span, &format!("can't have {kinds} parameters"))
+                            .span_label(item.span, format!("can't have {kinds} parameters"))
                             .help(
                                 // FIXME: once we start storing spans for type arguments, turn this
                                 // into a suggestion.
-                                &format!(
+                                format!(
                                     "replace the {} parameters with concrete {}{}",
                                     kinds,
                                     kinds_pl,
@@ -866,7 +861,7 @@ fn check_impl_items_against_trait<'tcx>(
         if !missing_items.is_empty() {
             let full_impl_span =
                 tcx.hir().span_with_body(tcx.hir().local_def_id_to_hir_id(impl_id));
-            missing_items_err(tcx, tcx.def_span(impl_id), &missing_items, full_impl_span);
+            missing_items_err(tcx, impl_id, &missing_items, full_impl_span);
         }
 
         if let Some(missing_items) = must_implement_one_of {
@@ -990,10 +985,7 @@ pub(super) fn check_packed(tcx: TyCtxt<'_>, sp: Span, def: ty::AdtDef<'_>) {
 
                 err.span_note(
                     tcx.def_span(def_spans[0].0),
-                    &format!(
-                        "`{}` has a `#[repr(align)]` attribute",
-                        tcx.item_name(def_spans[0].0)
-                    ),
+                    format!("`{}` has a `#[repr(align)]` attribute", tcx.item_name(def_spans[0].0)),
                 );
 
                 if def_spans.len() > 2 {
@@ -1002,7 +994,7 @@ pub(super) fn check_packed(tcx: TyCtxt<'_>, sp: Span, def: ty::AdtDef<'_>) {
                         let ident = tcx.item_name(*adt_def);
                         err.span_note(
                             *span,
-                            &if first {
+                            if first {
                                 format!(
                                     "`{}` contains a field of type `{}`",
                                     tcx.type_of(def.did()).subst_identity(),
@@ -1471,10 +1463,10 @@ fn opaque_type_cycle_error(
                     let ty_span = tcx.def_span(def_id);
                     if !seen.contains(&ty_span) {
                         let descr = if ty.is_impl_trait() { "opaque " } else { "" };
-                        err.span_label(ty_span, &format!("returning this {descr}type `{ty}`"));
+                        err.span_label(ty_span, format!("returning this {descr}type `{ty}`"));
                         seen.insert(ty_span);
                     }
-                    err.span_label(sp, &format!("returning here with type `{ty}`"));
+                    err.span_label(sp, format!("returning here with type `{ty}`"));
                 }
 
                 for closure_def_id in visitor.closures {

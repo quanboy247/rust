@@ -5,10 +5,14 @@
 //! This API is completely unstable and subject to change.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![feature(assert_matches)]
+#![feature(iterator_try_collect)]
 #![feature(let_chains)]
 #![feature(never_type)]
 #![feature(box_patterns)]
 #![recursion_limit = "256"]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate rustc_middle;
@@ -16,7 +20,7 @@ extern crate rustc_middle;
 extern crate tracing;
 
 use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_macros::fluent_messages;
+use rustc_fluent_macro::fluent_messages;
 use rustc_middle::ty::query::Providers;
 
 mod abi;

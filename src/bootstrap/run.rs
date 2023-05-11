@@ -105,7 +105,7 @@ impl Step for BumpStage0 {
 
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         let mut cmd = builder.tool_cmd(Tool::BumpStage0);
-        cmd.args(builder.config.cmd.args());
+        cmd.args(builder.config.args());
         builder.run(&mut cmd);
     }
 }
@@ -182,8 +182,7 @@ impl Step for Miri {
         miri.add_rustc_lib_path(builder, compiler);
         // Forward arguments.
         miri.arg("--").arg("--target").arg(target.rustc_target_arg());
-        miri.args(builder.config.cmd.args());
-        miri.args(&builder.config.free_args);
+        miri.args(builder.config.args());
 
         // miri tests need to know about the stage sysroot
         miri.env("MIRI_SYSROOT", &miri_sysroot);
@@ -252,5 +251,27 @@ impl Step for GenerateCopyright {
         builder.run(&mut cmd);
 
         dest
+    }
+}
+
+#[derive(Debug, PartialOrd, Ord, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct GenerateWindowsSys;
+
+impl Step for GenerateWindowsSys {
+    type Output = ();
+    const ONLY_HOSTS: bool = true;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.path("src/tools/generate-windows-sys")
+    }
+
+    fn make_run(run: RunConfig<'_>) {
+        run.builder.ensure(GenerateWindowsSys);
+    }
+
+    fn run(self, builder: &Builder<'_>) {
+        let mut cmd = builder.tool_cmd(Tool::GenerateWindowsSys);
+        cmd.arg(&builder.src);
+        builder.run(&mut cmd);
     }
 }

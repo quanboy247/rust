@@ -42,7 +42,7 @@ resolve_try_adding_local_generic_param_on_method =
     try adding a local generic parameter in this method instead
 
 resolve_help_try_using_local_generic_param =
-    try using a local generic paramter instead
+    try using a local generic parameter instead
 
 resolve_name_is_already_used_as_generic_parameter =
     the name `{$name}` is already used for a generic parameter in this item's generic parameters
@@ -145,6 +145,15 @@ resolve_param_in_ty_of_const_param =
     the type of const parameters must not depend on other generic parameters
     .label = the type must not depend on the parameter `{$name}`
 
+resolve_type_param_in_ty_of_const_param =
+    type parameters may not be used in the type of const parameters
+
+resolve_const_param_in_ty_of_const_param =
+    const parameters may not be used in the type of const parameters
+
+resolve_lifetime_param_in_ty_of_const_param =
+    lifetime parameters may not be used in the type of const parameters
+
 resolve_self_in_generic_param_default =
     generic parameters cannot use `Self` in their defaults
     .label = `Self` in generic parameter default
@@ -156,11 +165,14 @@ resolve_param_in_non_trivial_anon_const =
 resolve_param_in_non_trivial_anon_const_help =
     use `#![feature(generic_const_exprs)]` to allow generic const expressions
 
-resolve_param_in_non_trivial_anon_const_sub_type =
+resolve_type_param_in_non_trivial_anon_const =
     type parameters may not be used in const expressions
 
-resolve_param_in_non_trivial_anon_const_sub_non_type =
+resolve_const_param_in_non_trivial_anon_const =
     const parameters may only be used as standalone arguments, i.e. `{$name}`
+
+resolve_lifetime_param_in_non_trivial_anon_const =
+    lifetime parameters may not be used in const expressions
 
 resolve_unreachable_label =
     use of unreachable label `{$name}`
@@ -207,5 +219,42 @@ resolve_expected_found =
 resolve_indeterminate =
     cannot determine resolution for the visibility
 
+resolve_tool_module_imported =
+    cannot use a tool module through an import
+    .note = the tool module imported here
+
 resolve_module_only =
     visibility must resolve to a module
+
+resolve_macro_expected_found =
+    expected {$expected}, found {$found} `{$macro_path}`
+
+resolve_remove_surrounding_derive =
+    remove from the surrounding `derive()`
+
+resolve_add_as_non_derive =
+    add as non-Derive macro
+    `#[{$macro_path}]`
+
+resolve_proc_macro_same_crate = can't use a procedural macro from the same crate that defines it
+    .help = you can define integration tests in a directory named `tests`
+
+resolve_imported_crate = `$crate` may not be imported
+
+resolve_macro_use_extern_crate_self = `#[macro_use]` is not supported on `extern crate self`
+
+resolve_accessible_unsure = not sure whether the path is accessible or not
+    .note = the type may have associated items, but we are currently not checking them
+
+resolve_param_in_enum_discriminant =
+    generic parameters may not be used in enum discriminant values
+    .label = cannot perform const operation using `{$name}`
+
+resolve_type_param_in_enum_discriminant =
+    type parameters may not be used in enum discriminant values
+
+resolve_const_param_in_enum_discriminant =
+    const parameters may not be used in enum discriminant values
+
+resolve_lifetime_param_in_enum_discriminant =
+    lifetime parameters may not be used in enum discriminant values

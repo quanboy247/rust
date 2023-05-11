@@ -7,6 +7,7 @@ use rustc_span::{source_map::DUMMY_SP, SpanData, Symbol};
 use rustc_target::abi::{Align, Size};
 
 use crate::borrow_tracker::stacked_borrows::diagnostics::TagHistory;
+use crate::borrow_tracker::tree_borrows::diagnostics as tree_diagnostics;
 use crate::*;
 
 /// Details of premature program termination.
@@ -23,8 +24,9 @@ pub enum TerminationInfo {
         history: Option<TagHistory>,
     },
     TreeBorrowsUb {
-        msg: String,
-        // FIXME: incomplete
+        title: String,
+        details: Vec<String>,
+        history: tree_diagnostics::HistoryData,
     },
     Int2PtrWithStrictProvenance,
     Deadlock,
@@ -65,7 +67,7 @@ impl fmt::Display for TerminationInfo {
                     "integer-to-pointer casts and `ptr::from_exposed_addr` are not supported with `-Zmiri-strict-provenance`"
                 ),
             StackedBorrowsUb { msg, .. } => write!(f, "{msg}"),
-            TreeBorrowsUb { msg } => write!(f, "{msg}"),
+            TreeBorrowsUb { title, .. } => write!(f, "{title}"),
             Deadlock => write!(f, "the evaluated program deadlocked"),
             MultipleSymbolDefinitions { link_name, .. } =>
                 write!(f, "multiple definitions of symbol `{link_name}`"),
@@ -105,7 +107,7 @@ pub enum NonHaltingDiagnostic {
 }
 
 /// Level of Miri specific diagnostics
-enum DiagLevel {
+pub enum DiagLevel {
     Error,
     Warning,
     Note,
@@ -114,7 +116,7 @@ enum DiagLevel {
 /// Attempts to prune a stacktrace to omit the Rust runtime, and returns a bool indicating if any
 /// frames were pruned. If the stacktrace does not have any local frames, we conclude that it must
 /// be pointing to a problem in the Rust runtime itself, and do not prune it at all.
-fn prune_stacktrace<'tcx>(
+pub fn prune_stacktrace<'tcx>(
     mut stacktrace: Vec<FrameInfo<'tcx>>,
     machine: &MiriMachine<'_, 'tcx>,
 ) -> (Vec<FrameInfo<'tcx>>, bool) {
@@ -219,10 +221,16 @@ pub fn report_error<'tcx, 'mir>(
                 }
                 helps
             },
-            TreeBorrowsUb { .. } => {
-                let helps = vec![
-                    (None, format!("this indicates a potential bug in the program: it performed an invalid operation, but the Tree Borrows rules it violated are still experimental")),
+            TreeBorrowsUb { title: _, details, history } => {
+                let mut helps = vec![
+                    (None, format!("this indicates a potential bug in the program: it performed an invalid operation, but the Tree Borrows rules it violated are still experimental"))
                 ];
+                for m in details {
+                    helps.push((None, m.clone()));
+                }
+                for event in history.events.clone() {
+                    helps.push(event);
+                }
                 helps
             }
             MultipleSymbolDefinitions { first, first_crate, second, second_crate, .. } =>
@@ -338,12 +346,45 @@ pub fn report_error<'tcx, 'mir>(
     None
 }
 
+pub fn report_leaks<'mir, 'tcx>(
+    ecx: &InterpCx<'mir, 'tcx, MiriMachine<'mir, 'tcx>>,
+    leaks: Vec<(AllocId, MemoryKind<MiriMemoryKind>, Allocation<Provenance, AllocExtra<'tcx>>)>,
+) {
+    let mut any_pruned = false;
+    for (id, kind, mut alloc) in leaks {
+        let Some(backtrace) = alloc.extra.backtrace.take() else {
+            continue;
+        };
+        let (backtrace, pruned) = prune_stacktrace(backtrace, &ecx.machine);
+        any_pruned |= pruned;
+        report_msg(
+            DiagLevel::Error,
+            &format!(
+                "memory leaked: {id:?} ({}, size: {:?}, align: {:?}), allocated here:",
+                kind,
+                alloc.size().bytes(),
+                alloc.align.bytes()
+            ),
+            vec![],
+            vec![],
+            vec![],
+            &backtrace,
+            &ecx.machine,
+        );
+    }
+    if any_pruned {
+        ecx.tcx.sess.diagnostic().note_without_error(
+            "some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace",
+        );
+    }
+}
+
 /// Report an error or note (depending on the `error` argument) with the given stacktrace.
 /// Also emits a full stacktrace of the interpreter stack.
 /// We want to present a multi-line span message for some errors. Diagnostics do not support this
 /// directly, so we pass the lines as a `Vec<String>` and display each line after the first with an
 /// additional `span_label` or `note` call.
-fn report_msg<'tcx>(
+pub fn report_msg<'tcx>(
     diag_level: DiagLevel,
     title: &str,
     span_msg: Vec<String>,
@@ -368,14 +409,15 @@ fn report_msg<'tcx>(
     } else {
         // Make sure we show the message even when it is a dummy span.
         for line in span_msg {
-            err.note(&line);
+            err.note(line);
         }
         err.note("(no span available)");
     }
 
     // Show note and help messages.
     let mut extra_span = false;
-    for (span_data, note) in &notes {
+    let notes_len = notes.len();
+    for (span_data, note) in notes {
         if let Some(span_data) = span_data {
             err.span_note(span_data.span(), note);
             extra_span = true;
@@ -383,7 +425,8 @@ fn report_msg<'tcx>(
             err.note(note);
         }
     }
-    for (span_data, help) in &helps {
+    let helps_len = helps.len();
+    for (span_data, help) in helps {
         if let Some(span_data) = span_data {
             err.span_help(span_data.span(), help);
             extra_span = true;
@@ -391,7 +434,7 @@ fn report_msg<'tcx>(
             err.help(help);
         }
     }
-    if notes.len() + helps.len() > 0 {
+    if notes_len + helps_len > 0 {
         // Add visual separator before backtrace.
         err.note(if extra_span { "BACKTRACE (of the first span):" } else { "BACKTRACE:" });
     }
@@ -400,7 +443,7 @@ fn report_msg<'tcx>(
         let is_local = machine.is_local(frame_info);
         // No span for non-local frames and the first frame (which is the error site).
         if is_local && idx > 0 {
-            err.span_note(frame_info.span, &frame_info.to_string());
+            err.span_note(frame_info.span, frame_info.to_string());
         } else {
             let sm = sess.source_map();
             let span = sm.span_to_embeddable_string(frame_info.span);

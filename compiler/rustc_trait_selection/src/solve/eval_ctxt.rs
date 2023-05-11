@@ -3,7 +3,8 @@ use rustc_infer::infer::at::ToTrace;
 use rustc_infer::infer::canonical::CanonicalVarValues;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_infer::infer::{
-    DefineOpaqueTypes, InferCtxt, InferOk, LateBoundRegionConversionTime, TyCtxtInferExt,
+    DefineOpaqueTypes, InferCtxt, InferOk, LateBoundRegionConversionTime, RegionVariableOrigin,
+    TyCtxtInferExt,
 };
 use rustc_infer::traits::query::NoSolution;
 use rustc_infer::traits::ObligationCause;
@@ -57,6 +58,14 @@ pub struct EvalCtxt<'a, 'tcx> {
     pub(super) search_graph: &'a mut SearchGraph<'tcx>,
 
     pub(super) nested_goals: NestedGoals<'tcx>,
+
+    // Has this `EvalCtxt` errored out with `NoSolution` in `try_evaluate_added_goals`?
+    //
+    // If so, then it can no longer be used to make a canonical query response,
+    // since subsequent calls to `try_evaluate_added_goals` have possibly dropped
+    // ambiguous goals. Instead, a probe needs to be introduced somewhere in the
+    // evaluation code.
+    tainted: Result<(), NoSolution>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -106,7 +115,7 @@ pub trait InferCtxtEvalExt<'tcx> {
 }
 
 impl<'tcx> InferCtxtEvalExt<'tcx> for InferCtxt<'tcx> {
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self), ret)]
     fn evaluate_root_goal(
         &self,
         goal: Goal<'tcx, ty::Predicate<'tcx>>,
@@ -121,6 +130,7 @@ impl<'tcx> InferCtxtEvalExt<'tcx> for InferCtxt<'tcx> {
             max_input_universe: ty::UniverseIndex::ROOT,
             var_values: CanonicalVarValues::dummy(),
             nested_goals: NestedGoals::new(),
+            tainted: Ok(()),
         };
         let result = ecx.evaluate_goal(IsNormalizesToHack::No, goal);
 
@@ -172,6 +182,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
                 max_input_universe: canonical_goal.max_universe,
                 search_graph,
                 nested_goals: NestedGoals::new(),
+                tainted: Ok(()),
             };
             ecx.compute_goal(goal)
         })
@@ -213,18 +224,20 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
         {
             debug!("rerunning goal to check result is stable");
             let (_orig_values, canonical_goal) = self.canonicalize_goal(goal);
-            let canonical_response =
+            let new_canonical_response =
                 EvalCtxt::evaluate_canonical_goal(self.tcx(), self.search_graph, canonical_goal)?;
-            if !canonical_response.value.var_values.is_identity() {
+            if !new_canonical_response.value.var_values.is_identity() {
                 bug!(
                     "unstable result: re-canonicalized goal={canonical_goal:#?} \
-                     response={canonical_response:#?}"
+                    first_response={canonical_response:#?} \
+                    second_response={new_canonical_response:#?}"
                 );
             }
-            if certainty != canonical_response.value.certainty {
+            if certainty != new_canonical_response.value.certainty {
                 bug!(
                     "unstable certainty: {certainty:#?} re-canonicalized goal={canonical_goal:#?} \
-                     response={canonical_response:#?}"
+                     first_response={canonical_response:#?} \
+                     second_response={new_canonical_response:#?}"
                 );
             }
         }
@@ -357,7 +370,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
                             // deal with `has_changed` in the next iteration.
                             new_goals.normalizes_to_hack_goal =
                                 Some(this.resolve_vars_if_possible(goal));
-                            has_changed = has_changed.map_err(|c| c.unify_and(certainty));
+                            has_changed = has_changed.map_err(|c| c.unify_with(certainty));
                         }
                     }
                 }
@@ -378,7 +391,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
                         Certainty::Yes => {}
                         Certainty::Maybe(_) => {
                             new_goals.goals.push(goal);
-                            has_changed = has_changed.map_err(|c| c.unify_and(certainty));
+                            has_changed = has_changed.map_err(|c| c.unify_with(certainty));
                         }
                     }
                 }
@@ -390,6 +403,10 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
                 }
             },
         );
+
+        if response.is_err() {
+            self.tainted = Err(NoSolution);
+        }
 
         self.nested_goals = goals;
         response
@@ -404,6 +421,7 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
             max_input_universe: self.max_input_universe,
             search_graph: self.search_graph,
             nested_goals: self.nested_goals.clone(),
+            tainted: self.tainted,
         };
         self.infcx.probe(|_| f(&mut ecx))
     }
@@ -417,6 +435,10 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
             kind: TypeVariableOriginKind::MiscVariable,
             span: DUMMY_SP,
         })
+    }
+
+    pub(super) fn next_region_infer(&self) -> ty::Region<'tcx> {
+        self.infcx.next_region_var(RegionVariableOrigin::MiscVariable(DUMMY_SP))
     }
 
     pub(super) fn next_const_infer(&self, ty: Ty<'tcx>) -> ty::Const<'tcx> {
@@ -552,7 +574,7 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
     ///
     /// If possible, try using `eq` instead which automatically handles nested
     /// goals correctly.
-    #[instrument(level = "debug", skip(self, param_env), ret)]
+    #[instrument(level = "trace", skip(self, param_env), ret)]
     pub(super) fn eq_and_get_goals<T: ToTrace<'tcx>>(
         &self,
         param_env: ty::ParamEnv<'tcx>,
@@ -638,5 +660,26 @@ impl<'tcx> EvalCtxt<'_, 'tcx> {
     ) -> Option<impl Iterator<Item = Goal<'tcx, ty::Predicate<'tcx>>>> {
         crate::traits::wf::unnormalized_obligations(self.infcx, param_env, arg)
             .map(|obligations| obligations.into_iter().map(|obligation| obligation.into()))
+    }
+
+    pub(super) fn is_transmutable(
+        &self,
+        src_and_dst: rustc_transmute::Types<'tcx>,
+        scope: Ty<'tcx>,
+        assume: rustc_transmute::Assume,
+    ) -> Result<Certainty, NoSolution> {
+        // FIXME(transmutability): This really should be returning nested goals for `Answer::If*`
+        match rustc_transmute::TransmuteTypeEnv::new(self.infcx).is_transmutable(
+            ObligationCause::dummy(),
+            src_and_dst,
+            scope,
+            assume,
+        ) {
+            rustc_transmute::Answer::Yes => Ok(Certainty::Yes),
+            rustc_transmute::Answer::No(_)
+            | rustc_transmute::Answer::IfTransmutable { .. }
+            | rustc_transmute::Answer::IfAll(_)
+            | rustc_transmute::Answer::IfAny(_) => Err(NoSolution),
+        }
     }
 }

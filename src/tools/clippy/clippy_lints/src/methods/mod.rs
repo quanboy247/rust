@@ -9,6 +9,7 @@ mod chars_last_cmp;
 mod chars_last_cmp_with_unwrap;
 mod chars_next_cmp;
 mod chars_next_cmp_with_unwrap;
+mod clear_with_drain;
 mod clone_on_copy;
 mod clone_on_ref_ptr;
 mod cloned_instead_of_copied;
@@ -110,7 +111,7 @@ use clippy_utils::ty::{contains_ty_adt_constructor_opaque, implements_trait, is_
 use clippy_utils::{contains_return, is_bool, is_trait_method, iter_input_pats, return_ty};
 use if_chain::if_chain;
 use rustc_hir as hir;
-use rustc_hir::{Expr, ExprKind, TraitItem, TraitItemKind};
+use rustc_hir::{Expr, ExprKind, Node, Stmt, StmtKind, TraitItem, TraitItemKind};
 use rustc_hir_analysis::hir_ty_to_ty;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
@@ -120,7 +121,7 @@ use rustc_span::{sym, Span};
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usages of `cloned()` on an `Iterator` or `Option` where
+    /// Checks for usage of `cloned()` on an `Iterator` or `Option` where
     /// `copied()` could be used instead.
     ///
     /// ### Why is this bad?
@@ -200,7 +201,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usages of `Iterator::flat_map()` where `filter_map()` could be
+    /// Checks for usage of `Iterator::flat_map()` where `filter_map()` could be
     /// used instead.
     ///
     /// ### Why is this bad?
@@ -440,7 +441,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usages of `_.unwrap_or_else(Default::default)` on `Option` and
+    /// Checks for usage of `_.unwrap_or_else(Default::default)` on `Option` and
     /// `Result` values.
     ///
     /// ### Why is this bad?
@@ -985,29 +986,6 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usage of `.clone()` on an `&&T`.
-    ///
-    /// ### Why is this bad?
-    /// Cloning an `&&T` copies the inner `&T`, instead of
-    /// cloning the underlying `T`.
-    ///
-    /// ### Example
-    /// ```rust
-    /// fn main() {
-    ///     let x = vec![1];
-    ///     let y = &&x;
-    ///     let z = y.clone();
-    ///     println!("{:p} {:p}", *y, z); // prints out the same pointer
-    /// }
-    /// ```
-    #[clippy::version = "pre 1.29.0"]
-    pub CLONE_DOUBLE_REF,
-    correctness,
-    "using `clone` on `&&T`"
-}
-
-declare_clippy_lint! {
-    /// ### What it does
     /// Checks for usage of `.to_string()` on an `&&T` where
     /// `T` implements `ToString` directly (like `&&str` or `&&String`).
     ///
@@ -1193,7 +1171,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `.iter().nth()` (and the related
+    /// Checks for usage of `.iter().nth()` (and the related
     /// `.iter_mut().nth()`) on standard library types with *O*(1) element access.
     ///
     /// ### Why is this bad?
@@ -1220,7 +1198,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `.skip(x).next()` on iterators.
+    /// Checks for usage of `.skip(x).next()` on iterators.
     ///
     /// ### Why is this bad?
     /// `.nth(x)` is cleaner
@@ -1245,7 +1223,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `.drain(..)` on `Vec` and `VecDeque` for iteration.
+    /// Checks for usage of `.drain(..)` on `Vec` and `VecDeque` for iteration.
     ///
     /// ### Why is this bad?
     /// `.into_iter()` is simpler with better performance.
@@ -1270,7 +1248,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for using `x.get(x.len() - 1)` instead of
+    /// Checks for usage of `x.get(x.len() - 1)` instead of
     /// `x.last()`.
     ///
     /// ### Why is this bad?
@@ -1303,7 +1281,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `.get().unwrap()` (or
+    /// Checks for usage of `.get().unwrap()` (or
     /// `.get_mut().unwrap`) on a standard library type which implements `Index`
     ///
     /// ### Why is this bad?
@@ -1474,7 +1452,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for using `fold` when a more succinct alternative exists.
+    /// Checks for usage of `fold` when a more succinct alternative exists.
     /// Specifically, this checks for `fold`s which could be replaced by `any`, `all`,
     /// `sum` or `product`.
     ///
@@ -2160,7 +2138,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usages of `str::splitn(2, _)`
+    /// Checks for usage of `str::splitn(2, _)`
     ///
     /// ### Why is this bad?
     /// `split_once` is both clearer in intent and slightly more efficient.
@@ -2196,7 +2174,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usages of `str::splitn` (or `str::rsplitn`) where using `str::split` would be the same.
+    /// Checks for usage of `str::splitn` (or `str::rsplitn`) where using `str::split` would be the same.
     /// ### Why is this bad?
     /// The function `split` is simpler and there is no performance difference in these cases, considering
     /// that both functions return a lazy iterator.
@@ -2250,7 +2228,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of `.collect::<Vec<String>>().join("")` on iterators.
+    /// Checks for usage of `.collect::<Vec<String>>().join("")` on iterators.
     ///
     /// ### Why is this bad?
     /// `.collect::<String>()` is more concise and might be more performant
@@ -2376,7 +2354,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for usages of `.then_some(..).unwrap_or(..)`
+    /// Checks for usage of `.then_some(..).unwrap_or(..)`
     ///
     /// ### Why is this bad?
     /// This can be written more clearly with `if .. else ..`
@@ -2552,7 +2530,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for using `x.get(0)` instead of
+    /// Checks for usage of `x.get(0)` instead of
     /// `x.first()`.
     ///
     /// ### Why is this bad?
@@ -2956,7 +2934,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Detects uses of `Vec::sort_by` passing in a closure
+    /// Checks for usage of `Vec::sort_by` passing in a closure
     /// which compares the two arguments, either directly or indirectly.
     ///
     /// ### Why is this bad?
@@ -3012,7 +2990,7 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
-    /// Checks for use of File::read_to_end and File::read_to_string.
+    /// Checks for usage of File::read_to_end and File::read_to_string.
     ///
     /// ### Why is this bad?
     /// `fs::{read, read_to_string}` provide the same functionality when `buf` is empty with fewer imports and no intermediate values.
@@ -3184,10 +3162,35 @@ declare_clippy_lint! {
     /// ```rust
     /// std::process::Command::new("echo").args(["-n", "hello"]).spawn().unwrap();
     /// ```
-    #[clippy::version = "1.67.0"]
+    #[clippy::version = "1.69.0"]
     pub SUSPICIOUS_COMMAND_ARG_SPACE,
     suspicious,
     "single command line argument that looks like it should be multiple arguments"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for usage of `.drain(..)` for the sole purpose of clearing a container.
+    ///
+    /// ### Why is this bad?
+    /// This creates an unnecessary iterator that is dropped immediately.
+    ///
+    /// Calling `.clear()` also makes the intent clearer.
+    ///
+    /// ### Example
+    /// ```rust
+    /// let mut v = vec![1, 2, 3];
+    /// v.drain(..);
+    /// ```
+    /// Use instead:
+    /// ```rust
+    /// let mut v = vec![1, 2, 3];
+    /// v.clear();
+    /// ```
+    #[clippy::version = "1.69.0"]
+    pub CLEAR_WITH_DRAIN,
+    nursery,
+    "calling `drain` in order to `clear` a container"
 }
 
 pub struct Methods {
@@ -3232,7 +3235,6 @@ impl_lint_pass!(Methods => [
     CHARS_LAST_CMP,
     CLONE_ON_COPY,
     CLONE_ON_REF_PTR,
-    CLONE_DOUBLE_REF,
     COLLAPSIBLE_STR_REPLACE,
     ITER_OVEREAGER_CLONED,
     CLONED_INSTEAD_OF_COPIED,
@@ -3318,6 +3320,7 @@ impl_lint_pass!(Methods => [
     SEEK_TO_START_INSTEAD_OF_REWIND,
     NEEDLESS_COLLECT,
     SUSPICIOUS_COMMAND_ARG_SPACE,
+    CLEAR_WITH_DRAIN,
 ]);
 
 /// Extracts a method call name, args, and `Span` of the method name.
@@ -3473,8 +3476,7 @@ impl<'tcx> LateLintPass<'tcx> for Methods {
                 let first_arg_span = first_arg_ty.span;
                 let first_arg_ty = hir_ty_to_ty(cx.tcx, first_arg_ty);
                 let self_ty = TraitRef::identity(cx.tcx, item.owner_id.to_def_id())
-                    .self_ty()
-                    .skip_binder();
+                    .self_ty();
                 wrong_self_convention::check(
                     cx,
                     item.ident.name.as_str(),
@@ -3492,8 +3494,7 @@ impl<'tcx> LateLintPass<'tcx> for Methods {
             if let TraitItemKind::Fn(_, _) = item.kind;
             let ret_ty = return_ty(cx, item.owner_id);
             let self_ty = TraitRef::identity(cx.tcx, item.owner_id.to_def_id())
-                .self_ty()
-                .skip_binder();
+                .self_ty();
             if !ret_ty.contains(self_ty);
 
             then {
@@ -3562,8 +3563,15 @@ impl Methods {
                     Some(("bytes", recv2, [], _, _)) => bytes_count_to_len::check(cx, expr, recv, recv2),
                     _ => {},
                 },
-                ("drain", [arg]) => {
-                    iter_with_drain::check(cx, expr, recv, span, arg);
+                ("drain", ..) => {
+                    if let Node::Stmt(Stmt { hir_id: _, kind, .. }) = cx.tcx.hir().get_parent(expr.hir_id)
+                        && matches!(kind, StmtKind::Semi(_))
+                        && args.len() <= 1
+                    {
+                        clear_with_drain::check(cx, expr, recv, span, args.first());
+                    } else if let [arg] = args {
+                        iter_with_drain::check(cx, expr, recv, span, arg);
+                    }
                 },
                 ("ends_with", [arg]) => {
                     if let ExprKind::MethodCall(.., span) = expr.kind {

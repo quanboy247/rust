@@ -21,6 +21,9 @@
 #[macro_use]
 extern crate tracing;
 
+use errors::{
+    ParamKindInEnumDiscriminant, ParamKindInNonTrivialAnonConst, ParamKindInTyOfConstParam,
+};
 use rustc_arena::{DroplessArena, TypedArena};
 use rustc_ast::node_id::NodeMap;
 use rustc_ast::{self as ast, attr, NodeId, CRATE_NODE_ID};
@@ -33,14 +36,14 @@ use rustc_errors::{
     Applicability, DiagnosticBuilder, DiagnosticMessage, ErrorGuaranteed, SubdiagnosticMessage,
 };
 use rustc_expand::base::{DeriveResolutions, SyntaxExtension, SyntaxExtensionKind};
+use rustc_fluent_macro::fluent_messages;
 use rustc_hir::def::Namespace::{self, *};
 use rustc_hir::def::{self, CtorOf, DefKind, DocLinkResMap, LifetimeRes, PartialRes, PerNS};
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LocalDefIdMap, LocalDefIdSet};
 use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathData;
 use rustc_hir::TraitCandidate;
-use rustc_index::vec::IndexVec;
-use rustc_macros::fluent_messages;
+use rustc_index::IndexVec;
 use rustc_metadata::creader::{CStore, CrateLoader};
 use rustc_middle::metadata::ModChild;
 use rustc_middle::middle::privacy::EffectiveVisibilities;
@@ -223,11 +226,15 @@ enum ResolutionError<'a> {
     /// Error E0128: generic parameters with a default cannot use forward-declared identifiers.
     ForwardDeclaredGenericParam,
     /// ERROR E0770: the type of const parameters must not depend on other generic parameters.
-    ParamInTyOfConstParam(Symbol),
+    ParamInTyOfConstParam { name: Symbol, param_kind: Option<ParamKindInTyOfConstParam> },
     /// generic parameters must not be used inside const evaluations.
     ///
     /// This error is only emitted when using `min_const_generics`.
-    ParamInNonTrivialAnonConst { name: Symbol, is_type: bool },
+    ParamInNonTrivialAnonConst { name: Symbol, param_kind: ParamKindInNonTrivialAnonConst },
+    /// generic parameters must not be used inside enum discriminants.
+    ///
+    /// This error is emitted even with `generic_const_exprs`.
+    ParamInEnumDiscriminant { name: Symbol, param_kind: ParamKindInEnumDiscriminant },
     /// Error E0735: generic parameters with a default cannot use `Self`
     SelfInGenericParamDefault,
     /// Error E0767: use of unreachable label
@@ -312,7 +319,6 @@ impl<'a> From<&'a ast::PathSegment> for Segment {
                     (args.span, found_lifetimes)
                 }
                 GenericArgs::Parenthesized(args) => (args.span, true),
-                GenericArgs::ReturnTypeNotation(span) => (*span, false),
             }
         } else {
             (DUMMY_SP, false)
@@ -910,7 +916,7 @@ pub struct Resolver<'a, 'tcx> {
 
     /// `CrateNum` resolutions of `extern crate` items.
     extern_crate_map: FxHashMap<LocalDefId, CrateNum>,
-    reexport_map: FxHashMap<LocalDefId, Vec<ModChild>>,
+    module_children: LocalDefIdMap<Vec<ModChild>>,
     trait_map: NodeMap<Vec<TraitCandidate>>,
 
     /// A map from nodes to anonymous modules.
@@ -1260,7 +1266,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             lifetimes_res_map: Default::default(),
             extra_lifetime_params_map: Default::default(),
             extern_crate_map: Default::default(),
-            reexport_map: FxHashMap::default(),
+            module_children: Default::default(),
             trait_map: NodeMap::default(),
             underscore_disambiguator: 0,
             empty_module,
@@ -1387,7 +1393,6 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         let visibilities = self.visibilities;
         let has_pub_restricted = self.has_pub_restricted;
         let extern_crate_map = self.extern_crate_map;
-        let reexport_map = self.reexport_map;
         let maybe_unused_trait_imports = self.maybe_unused_trait_imports;
         let glob_map = self.glob_map;
         let main_def = self.main_def;
@@ -1399,7 +1404,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             has_pub_restricted,
             effective_visibilities,
             extern_crate_map,
-            reexport_map,
+            module_children: self.module_children,
             glob_map,
             maybe_unused_trait_imports,
             main_def,
@@ -1652,7 +1657,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 misc2: AmbiguityErrorMisc::None,
             };
             if !self.matches_previous_ambiguity_error(&ambiguity_error) {
-                // avoid dumplicated span information to be emitt out
+                // avoid duplicated span information to be emitt out
                 self.ambiguity_errors.push(ambiguity_error);
             }
         }
@@ -1949,20 +1954,6 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             self.record_use(ident, name_binding, false);
         }
         self.main_def = Some(MainDefinition { res, is_import, span });
-    }
-
-    // Items that go to reexport table encoded to metadata and visible through it to other crates.
-    fn is_reexport(&self, binding: &NameBinding<'a>) -> Option<def::Res<!>> {
-        if binding.is_import() {
-            let res = binding.res().expect_non_local();
-            // Ambiguous imports are treated as errors at this point and are
-            // not exposed to other crates (see #36837 for more details).
-            if res != def::Res::Err && !binding.is_ambiguity() {
-                return Some(res);
-            }
-        }
-
-        return None;
     }
 }
 

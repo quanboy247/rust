@@ -222,7 +222,7 @@ impl LinkerPluginLto {
 }
 
 /// The different settings that can be enabled via the `-Z location-detail` flag.
-#[derive(Clone, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Hash, Debug)]
 pub struct LocationDetail {
     pub file: bool,
     pub line: bool,
@@ -518,6 +518,12 @@ pub struct ExternEntry {
     /// `--extern nounused:std=/path/to/lib/libstd.rlib`. This is used to
     /// suppress `unused-crate-dependencies` warnings.
     pub nounused_dep: bool,
+    /// If the extern entry is not referenced in the crate, force it to be resolved anyway.
+    ///
+    /// Allows a dependency satisfying, for instance, a missing panic handler to be injected
+    /// without modifying source:
+    /// `--extern force:extras=/path/to/lib/libstd.rlib`
+    pub force: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -556,7 +562,13 @@ impl Externs {
 
 impl ExternEntry {
     fn new(location: ExternLocation) -> ExternEntry {
-        ExternEntry { location, is_private_dep: false, add_prelude: false, nounused_dep: false }
+        ExternEntry {
+            location,
+            is_private_dep: false,
+            add_prelude: false,
+            nounused_dep: false,
+            force: false,
+        }
     }
 
     pub fn files(&self) -> Option<impl Iterator<Item = &CanonicalizedPath>> {
@@ -582,10 +594,12 @@ pub enum PrintRequest {
     CodeModels,
     TlsModels,
     TargetSpec,
+    AllTargetSpecs,
     NativeStaticLibs,
     StackProtectorStrategies,
     LinkArgs,
     SplitDebuginfo,
+    DeploymentTarget,
 }
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -1035,6 +1049,14 @@ fn default_configuration(sess: &Session) -> CrateConfig {
         ret.insert((sym::sanitize, Some(symbol)));
     }
 
+    if sess.is_sanitizer_cfi_generalize_pointers_enabled() {
+        ret.insert((sym::sanitizer_cfi_generalize_pointers, None));
+    }
+
+    if sess.is_sanitizer_cfi_normalize_integers_enabled() {
+        ret.insert((sym::sanitizer_cfi_normalize_integers, None));
+    }
+
     if sess.opts.debug_assertions {
         ret.insert((sym::debug_assertions, None));
     }
@@ -1055,37 +1077,76 @@ pub fn to_crate_config(cfg: FxHashSet<(String, Option<String>)>) -> CrateConfig 
 
 /// The parsed `--check-cfg` options
 pub struct CheckCfg<T = String> {
-    /// The set of all `names()`, if None no name checking is performed
-    pub names_valid: Option<FxHashSet<T>>,
+    /// Is well known names activated
+    pub exhaustive_names: bool,
     /// Is well known values activated
-    pub well_known_values: bool,
-    /// The set of all `values()`
-    pub values_valid: FxHashMap<T, FxHashSet<T>>,
+    pub exhaustive_values: bool,
+    /// All the expected values for a config name
+    pub expecteds: FxHashMap<T, ExpectedValues<T>>,
 }
 
 impl<T> Default for CheckCfg<T> {
     fn default() -> Self {
         CheckCfg {
-            names_valid: Default::default(),
-            values_valid: Default::default(),
-            well_known_values: false,
+            exhaustive_names: false,
+            exhaustive_values: false,
+            expecteds: FxHashMap::default(),
         }
     }
 }
 
 impl<T> CheckCfg<T> {
-    fn map_data<O: Eq + Hash>(&self, f: impl Fn(&T) -> O) -> CheckCfg<O> {
+    fn map_data<O: Eq + Hash>(self, f: impl Fn(T) -> O) -> CheckCfg<O> {
         CheckCfg {
-            names_valid: self
-                .names_valid
-                .as_ref()
-                .map(|names_valid| names_valid.iter().map(|a| f(a)).collect()),
-            values_valid: self
-                .values_valid
-                .iter()
-                .map(|(a, b)| (f(a), b.iter().map(|b| f(b)).collect()))
+            exhaustive_names: self.exhaustive_names,
+            exhaustive_values: self.exhaustive_values,
+            expecteds: self
+                .expecteds
+                .into_iter()
+                .map(|(name, values)| {
+                    (
+                        f(name),
+                        match values {
+                            ExpectedValues::Some(values) => ExpectedValues::Some(
+                                values.into_iter().map(|b| b.map(|b| f(b))).collect(),
+                            ),
+                            ExpectedValues::Any => ExpectedValues::Any,
+                        },
+                    )
+                })
                 .collect(),
-            well_known_values: self.well_known_values,
+        }
+    }
+}
+
+pub enum ExpectedValues<T> {
+    Some(FxHashSet<Option<T>>),
+    Any,
+}
+
+impl<T: Eq + Hash> ExpectedValues<T> {
+    fn insert(&mut self, value: T) -> bool {
+        match self {
+            ExpectedValues::Some(expecteds) => expecteds.insert(Some(value)),
+            ExpectedValues::Any => false,
+        }
+    }
+}
+
+impl<T: Eq + Hash> Extend<T> for ExpectedValues<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        match self {
+            ExpectedValues::Some(expecteds) => expecteds.extend(iter.into_iter().map(Some)),
+            ExpectedValues::Any => {}
+        }
+    }
+}
+
+impl<'a, T: Eq + Hash + Copy + 'a> Extend<&'a T> for ExpectedValues<T> {
+    fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
+        match self {
+            ExpectedValues::Some(expecteds) => expecteds.extend(iter.into_iter().map(|a| Some(*a))),
+            ExpectedValues::Any => {}
         }
     }
 }
@@ -1094,58 +1155,27 @@ impl<T> CheckCfg<T> {
 /// `rustc_interface::interface::Config` accepts this in the compiler configuration,
 /// but the symbol interner is not yet set up then, so we must convert it later.
 pub fn to_crate_check_config(cfg: CheckCfg) -> CrateCheckConfig {
-    cfg.map_data(|s| Symbol::intern(s))
+    cfg.map_data(|s| Symbol::intern(&s))
 }
 
 impl CrateCheckConfig {
-    /// Fills a `CrateCheckConfig` with well-known configuration names.
-    fn fill_well_known_names(&mut self) {
-        // NOTE: This should be kept in sync with `default_configuration` and
-        // `fill_well_known_values`
-        const WELL_KNOWN_NAMES: &[Symbol] = &[
-            // rustc
-            sym::unix,
-            sym::windows,
-            sym::target_os,
-            sym::target_family,
-            sym::target_arch,
-            sym::target_endian,
-            sym::target_pointer_width,
-            sym::target_env,
-            sym::target_abi,
-            sym::target_vendor,
-            sym::target_thread_local,
-            sym::target_has_atomic_load_store,
-            sym::target_has_atomic,
-            sym::target_has_atomic_equal_alignment,
-            sym::target_feature,
-            sym::panic,
-            sym::sanitize,
-            sym::debug_assertions,
-            sym::proc_macro,
-            sym::test,
-            sym::feature,
-            // rustdoc
-            sym::doc,
-            sym::doctest,
-            // miri
-            sym::miri,
-        ];
-
-        // We only insert well-known names if `names()` was activated
-        if let Some(names_valid) = &mut self.names_valid {
-            names_valid.extend(WELL_KNOWN_NAMES);
-        }
-    }
-
-    /// Fills a `CrateCheckConfig` with well-known configuration values.
-    fn fill_well_known_values(&mut self, current_target: &Target) {
-        if !self.well_known_values {
+    pub fn fill_well_known(&mut self, current_target: &Target) {
+        if !self.exhaustive_values && !self.exhaustive_names {
             return;
         }
 
-        // NOTE: This should be kept in sync with `default_configuration` and
-        // `fill_well_known_names`
+        let no_values = || {
+            let mut values = FxHashSet::default();
+            values.insert(None);
+            ExpectedValues::Some(values)
+        };
+
+        let empty_values = || {
+            let values = FxHashSet::default();
+            ExpectedValues::Some(values)
+        };
+
+        // NOTE: This should be kept in sync with `default_configuration`
 
         let panic_values = &PanicStrategy::all();
 
@@ -1165,6 +1195,9 @@ impl CrateCheckConfig {
         // Unknown possible values:
         //  - `feature`
         //  - `target_feature`
+        for name in [sym::feature, sym::target_feature] {
+            self.expecteds.entry(name).or_insert(ExpectedValues::Any);
+        }
 
         // No-values
         for name in [
@@ -1178,20 +1211,23 @@ impl CrateCheckConfig {
             sym::debug_assertions,
             sym::target_thread_local,
         ] {
-            self.values_valid.entry(name).or_default();
+            self.expecteds.entry(name).or_insert_with(no_values);
         }
 
         // Pre-defined values
-        self.values_valid.entry(sym::panic).or_default().extend(panic_values);
-        self.values_valid.entry(sym::sanitize).or_default().extend(sanitize_values);
-        self.values_valid.entry(sym::target_has_atomic).or_default().extend(atomic_values);
-        self.values_valid
-            .entry(sym::target_has_atomic_load_store)
-            .or_default()
+        self.expecteds.entry(sym::panic).or_insert_with(empty_values).extend(panic_values);
+        self.expecteds.entry(sym::sanitize).or_insert_with(empty_values).extend(sanitize_values);
+        self.expecteds
+            .entry(sym::target_has_atomic)
+            .or_insert_with(no_values)
             .extend(atomic_values);
-        self.values_valid
+        self.expecteds
+            .entry(sym::target_has_atomic_load_store)
+            .or_insert_with(no_values)
+            .extend(atomic_values);
+        self.expecteds
             .entry(sym::target_has_atomic_equal_alignment)
-            .or_default()
+            .or_insert_with(no_values)
             .extend(atomic_values);
 
         // Target specific values
@@ -1209,46 +1245,49 @@ impl CrateCheckConfig {
 
             // Initialize (if not already initialized)
             for &e in VALUES {
-                self.values_valid.entry(e).or_default();
+                let entry = self.expecteds.entry(e);
+                if !self.exhaustive_values {
+                    entry.or_insert(ExpectedValues::Any);
+                } else {
+                    entry.or_insert_with(empty_values);
+                }
             }
 
-            // Get all values map at once otherwise it would be costly.
-            // (8 values * 220 targets ~= 1760 times, at the time of writing this comment).
-            let [
-                values_target_os,
-                values_target_family,
-                values_target_arch,
-                values_target_endian,
-                values_target_env,
-                values_target_abi,
-                values_target_vendor,
-                values_target_pointer_width,
-            ] = self
-                .values_valid
-                .get_many_mut(VALUES)
-                .expect("unable to get all the check-cfg values buckets");
+            if self.exhaustive_values {
+                // Get all values map at once otherwise it would be costly.
+                // (8 values * 220 targets ~= 1760 times, at the time of writing this comment).
+                let [
+                    values_target_os,
+                    values_target_family,
+                    values_target_arch,
+                    values_target_endian,
+                    values_target_env,
+                    values_target_abi,
+                    values_target_vendor,
+                    values_target_pointer_width,
+                ] = self
+                    .expecteds
+                    .get_many_mut(VALUES)
+                    .expect("unable to get all the check-cfg values buckets");
 
-            for target in TARGETS
-                .iter()
-                .map(|target| Target::expect_builtin(&TargetTriple::from_triple(target)))
-                .chain(iter::once(current_target.clone()))
-            {
-                values_target_os.insert(Symbol::intern(&target.options.os));
-                values_target_family
-                    .extend(target.options.families.iter().map(|family| Symbol::intern(family)));
-                values_target_arch.insert(Symbol::intern(&target.arch));
-                values_target_endian.insert(Symbol::intern(target.options.endian.as_str()));
-                values_target_env.insert(Symbol::intern(&target.options.env));
-                values_target_abi.insert(Symbol::intern(&target.options.abi));
-                values_target_vendor.insert(Symbol::intern(&target.options.vendor));
-                values_target_pointer_width.insert(sym::integer(target.pointer_width));
+                for target in TARGETS
+                    .iter()
+                    .map(|target| Target::expect_builtin(&TargetTriple::from_triple(target)))
+                    .chain(iter::once(current_target.clone()))
+                {
+                    values_target_os.insert(Symbol::intern(&target.options.os));
+                    values_target_family.extend(
+                        target.options.families.iter().map(|family| Symbol::intern(family)),
+                    );
+                    values_target_arch.insert(Symbol::intern(&target.arch));
+                    values_target_endian.insert(Symbol::intern(target.options.endian.as_str()));
+                    values_target_env.insert(Symbol::intern(&target.options.env));
+                    values_target_abi.insert(Symbol::intern(&target.options.abi));
+                    values_target_vendor.insert(Symbol::intern(&target.options.vendor));
+                    values_target_pointer_width.insert(sym::integer(target.pointer_width));
+                }
             }
         }
-    }
-
-    pub fn fill_well_known(&mut self, current_target: &Target) {
-        self.fill_well_known_names();
-        self.fill_well_known_values(current_target);
     }
 }
 
@@ -1257,7 +1296,7 @@ pub fn build_configuration(sess: &Session, mut user_cfg: CrateConfig) -> CrateCo
     // some default and generated configuration items.
     let default_cfg = default_configuration(sess);
     // If the user wants a test runner, then add the test cfg.
-    if sess.opts.test {
+    if sess.is_test_crate() {
         user_cfg.insert((sym::test, None));
     }
     user_cfg.extend(default_cfg.iter().cloned());
@@ -1399,7 +1438,8 @@ The default is {DEFAULT_EDITION} and the latest stable edition is {LATEST_STABLE
 pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
     vec![
         opt::flag_s("h", "help", "Display this message"),
-        opt::multi_s("", "cfg", "Configure the compilation environment", "SPEC"),
+        opt::multi_s("", "cfg", "Configure the compilation environment.
+                             SPEC supports the syntax `NAME[=\"VALUE\"]`.", "SPEC"),
         opt::multi("", "check-cfg", "Provide list of valid cfg options for checking", "SPEC"),
         opt::multi_s(
             "L",
@@ -1425,7 +1465,7 @@ pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
         opt::opt_s(
             "",
             "edition",
-            &*EDITION_STRING,
+            &EDITION_STRING,
             EDITION_NAME_LIST,
         ),
         opt::multi_s(
@@ -1441,8 +1481,8 @@ pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
             "Compiler information to print on stdout",
             "[crate-name|file-names|sysroot|target-libdir|cfg|calling-conventions|\
              target-list|target-cpus|target-features|relocation-models|code-models|\
-             tls-models|target-spec-json|native-static-libs|stack-protector-strategies|\
-             link-args]",
+             tls-models|target-spec-json|all-target-specs-json|native-static-libs|\
+             stack-protector-strategies|link-args|deployment-target]",
         ),
         opt::flagmulti_s("g", "", "Equivalent to -C debuginfo=2"),
         opt::flagmulti_s("O", "", "Equivalent to -C opt-level=2"),
@@ -1889,8 +1929,10 @@ fn collect_print_requests(
         ("native-static-libs", PrintRequest::NativeStaticLibs),
         ("stack-protector-strategies", PrintRequest::StackProtectorStrategies),
         ("target-spec-json", PrintRequest::TargetSpec),
+        ("all-target-specs-json", PrintRequest::AllTargetSpecs),
         ("link-args", PrintRequest::LinkArgs),
         ("split-debuginfo", PrintRequest::SplitDebuginfo),
+        ("deployment-target", PrintRequest::DeploymentTarget),
     ];
 
     prints.extend(matches.opt_strs("print").into_iter().map(|req| {
@@ -1902,7 +1944,18 @@ fn collect_print_requests(
                     early_error(
                         error_format,
                         "the `-Z unstable-options` flag must also be passed to \
-                     enable the target-spec-json print option",
+                         enable the target-spec-json print option",
+                    );
+                }
+            }
+            Some((_, PrintRequest::AllTargetSpecs)) => {
+                if unstable_opts.unstable_options {
+                    PrintRequest::AllTargetSpecs
+                } else {
+                    early_error(
+                        error_format,
+                        "the `-Z unstable-options` flag must also be passed to \
+                         enable the all-target-specs-json print option",
                     );
                 }
             }
@@ -2222,6 +2275,7 @@ pub fn parse_externs(
         let mut is_private_dep = false;
         let mut add_prelude = true;
         let mut nounused_dep = false;
+        let mut force = false;
         if let Some(opts) = options {
             if !is_unstable_enabled {
                 early_error(
@@ -2244,6 +2298,7 @@ pub fn parse_externs(
                         }
                     }
                     "nounused" => nounused_dep = true,
+                    "force" => force = true,
                     _ => early_error(error_format, &format!("unknown --extern option `{opt}`")),
                 }
             }
@@ -2254,6 +2309,8 @@ pub fn parse_externs(
         entry.is_private_dep |= is_private_dep;
         // likewise `nounused`
         entry.nounused_dep |= nounused_dep;
+        // and `force`
+        entry.force |= force;
         // If any flag is missing `noprelude`, then add to the prelude.
         entry.add_prelude |= add_prelude;
     }

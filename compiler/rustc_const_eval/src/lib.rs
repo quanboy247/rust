@@ -20,7 +20,6 @@ Rust MIR: a lowered representation of Rust.
 #![feature(try_blocks)]
 #![feature(yeet_expr)]
 #![feature(if_let_guard)]
-#![feature(is_some_and)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -35,7 +34,7 @@ pub mod transform;
 pub mod util;
 
 use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_macros::fluent_messages;
+use rustc_fluent_macro::fluent_messages;
 use rustc_middle::ty;
 use rustc_middle::ty::query::Providers;
 

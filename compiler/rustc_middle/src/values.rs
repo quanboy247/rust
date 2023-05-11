@@ -106,6 +106,12 @@ impl<'tcx> Value<TyCtxt<'tcx>, DepKind> for ty::EarlyBinder<ty::Binder<'_, ty::F
     }
 }
 
+impl<'tcx, T> Value<TyCtxt<'tcx>, DepKind> for Result<T, ty::layout::LayoutError<'_>> {
+    fn from_cycle_error(_tcx: TyCtxt<'tcx>, _cycle: &[QueryInfo<DepKind>]) -> Self {
+        Err(ty::layout::LayoutError::Cycle)
+    }
+}
+
 // item_and_field_ids should form a cycle where each field contains the
 // type in the next element in the list
 pub fn recursive_type_error(
@@ -158,8 +164,8 @@ pub fn recursive_type_error(
     }
     let items_list = {
         let mut s = String::new();
-        for (i, (item_id, _)) in item_and_field_ids.iter().enumerate() {
-            let path = tcx.def_path_str(item_id.to_def_id());
+        for (i, &(item_id, _)) in item_and_field_ids.iter().enumerate() {
+            let path = tcx.def_path_str(item_id);
             write!(&mut s, "`{path}`").unwrap();
             if i == (ITEM_LIMIT - 1) && cycle_len > ITEM_LIMIT {
                 write!(&mut s, " and {} more", cycle_len - 5).unwrap();

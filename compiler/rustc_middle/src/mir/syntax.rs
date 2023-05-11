@@ -16,7 +16,7 @@ use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{self as hir};
 use rustc_hir::{self, GeneratorKind};
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_target::abi::{FieldIdx, VariantIdx};
 
 use rustc_ast::Mutability;
@@ -251,7 +251,7 @@ pub enum StatementKind<'tcx> {
     /// **Needs clarification**: The implication of the above idea would be that assignment implies
     /// that the resulting value is initialized. I believe we could commit to this separately from
     /// committing to whatever part of the memory model we would need to decide on to make the above
-    /// paragragh precise. Do we want to?
+    /// paragraph precise. Do we want to?
     ///
     /// Assignments in which the types of the place and rvalue differ are not well-formed.
     ///
@@ -331,9 +331,8 @@ pub enum StatementKind<'tcx> {
     /// This is especially useful for `let _ = PLACE;` bindings that desugar to a single
     /// `PlaceMention(PLACE)`.
     ///
-    /// When executed at runtime this is a nop.
-    ///
-    /// Disallowed after drop elaboration.
+    /// When executed at runtime, this computes the given place, but then discards
+    /// it without doing a load. It is UB if the place is not pointing to live memory.
     PlaceMention(Box<Place<'tcx>>),
 
     /// Encodes a user's type ascription. These need to be preserved
@@ -515,15 +514,15 @@ pub struct CopyNonOverlapping<'tcx> {
 ///
 /// A note on unwinding: Panics may occur during the execution of some terminators. Depending on the
 /// `-C panic` flag, this may either cause the program to abort or the call stack to unwind. Such
-/// terminators have a `cleanup: Option<BasicBlock>` field on them. If stack unwinding occurs, then
-/// once the current function is reached, execution continues at the given basic block, if any. If
-/// `cleanup` is `None` then no cleanup is performed, and the stack continues unwinding. This is
-/// equivalent to the execution of a `Resume` terminator.
+/// terminators have a `unwind: UnwindAction` field on them. If stack unwinding occurs, then
+/// once the current function is reached, an action will be taken based on the `unwind` field.
+/// If the action is `Cleanup`, then the execution continues at the given basic block. If the
+/// action is `Continue` then no cleanup is performed, and the stack continues unwinding.
 ///
-/// The basic block pointed to by a `cleanup` field must have its `cleanup` flag set. `cleanup`
-/// basic blocks have a couple restrictions:
-///  1. All `cleanup` fields in them must be `None`.
-///  2. `Return` terminators are not allowed in them. `Abort` and `Unwind` terminators are.
+/// The basic block pointed to by a `Cleanup` unwind action must have its `cleanup` flag set.
+/// `cleanup` basic blocks have a couple restrictions:
+///  1. All `unwind` fields in them must be `UnwindAction::Terminate` or `UnwindAction::Unreachable`.
+///  2. `Return` terminators are not allowed in them. `Terminate` and `Resume` terminators are.
 ///  3. All other basic blocks (in the current body) that are reachable from `cleanup` basic blocks
 ///     must also be `cleanup`. This is a part of the type system and checked statically, so it is
 ///     still an error to have such an edge in the CFG even if it's known that it won't be taken at
@@ -565,11 +564,11 @@ pub enum TerminatorKind<'tcx> {
     /// deaggregation runs.
     Resume,
 
-    /// Indicates that the landing pad is finished and that the process should abort.
+    /// Indicates that the landing pad is finished and that the process should terminate.
     ///
     /// Used to prevent unwinding for foreign items or with `-C unwind=abort`. Only permitted in
     /// cleanup blocks.
-    Abort,
+    Terminate,
 
     /// Returns from the function.
     ///
@@ -604,7 +603,7 @@ pub enum TerminatorKind<'tcx> {
     /// > The drop glue is executed if, among all statements executed within this `Body`, an assignment to
     /// > the place or one of its "parents" occurred more recently than a move out of it. This does not
     /// > consider indirect assignments.
-    Drop { place: Place<'tcx>, target: BasicBlock, unwind: Option<BasicBlock> },
+    Drop { place: Place<'tcx>, target: BasicBlock, unwind: UnwindAction },
 
     /// Roughly speaking, evaluates the `func` operand and the arguments, and starts execution of
     /// the referred to function. The operand types must match the argument types of the function.
@@ -628,8 +627,8 @@ pub enum TerminatorKind<'tcx> {
         destination: Place<'tcx>,
         /// Where to go after this call returns. If none, the call necessarily diverges.
         target: Option<BasicBlock>,
-        /// Cleanups to be done if the call unwinds.
-        cleanup: Option<BasicBlock>,
+        /// Action to be taken if the call unwinds.
+        unwind: UnwindAction,
         /// `true` if this is from a call in HIR rather than from an overloaded
         /// operator. True for overloaded function call.
         from_hir_call: bool,
@@ -652,9 +651,9 @@ pub enum TerminatorKind<'tcx> {
     Assert {
         cond: Operand<'tcx>,
         expected: bool,
-        msg: AssertMessage<'tcx>,
+        msg: Box<AssertMessage<'tcx>>,
         target: BasicBlock,
-        cleanup: Option<BasicBlock>,
+        unwind: UnwindAction,
     },
 
     /// Marks a suspend point.
@@ -720,9 +719,8 @@ pub enum TerminatorKind<'tcx> {
         /// in practice, but in order to avoid fragility we want to always
         /// consider it in borrowck. We don't want to accept programs which
         /// pass borrowck only when `panic=abort` or some assertions are disabled
-        /// due to release vs. debug mode builds. This needs to be an `Option` because
-        /// of the `remove_noop_landing_pads` and `abort_unwinding_calls` passes.
-        unwind: Option<BasicBlock>,
+        /// due to release vs. debug mode builds.
+        unwind: UnwindAction,
     },
 
     /// Block ends with an inline assembly block. This is a terminator since
@@ -745,10 +743,29 @@ pub enum TerminatorKind<'tcx> {
         /// diverging (InlineAsmOptions::NORETURN).
         destination: Option<BasicBlock>,
 
-        /// Cleanup to be done if the inline assembly unwinds. This is present
+        /// Action to be taken if the inline assembly unwinds. This is present
         /// if and only if InlineAsmOptions::MAY_UNWIND is set.
-        cleanup: Option<BasicBlock>,
+        unwind: UnwindAction,
     },
+}
+
+/// Action to be taken when a stack unwind happens.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
+#[derive(TypeFoldable, TypeVisitable)]
+pub enum UnwindAction {
+    /// No action is to be taken. Continue unwinding.
+    ///
+    /// This is similar to `Cleanup(bb)` where `bb` does nothing but `Resume`, but they are not
+    /// equivalent, as presence of `Cleanup(_)` will make a frame non-POF.
+    Continue,
+    /// Triggers undefined behavior if unwind happens.
+    Unreachable,
+    /// Terminates the execution if unwind happens.
+    ///
+    /// Depending on the platform and situation this may cause a non-unwindable panic or abort.
+    Terminate,
+    /// Cleanups to be done.
+    Cleanup(BasicBlock),
 }
 
 /// Information about an assertion failure.
@@ -979,7 +996,7 @@ pub type PlaceElem<'tcx> = ProjectionElem<Local, Ty<'tcx>>;
 /// This is what is implemented in miri today. Are these the semantics we want for MIR? Is this
 /// something we can even decide without knowing more about Rust's memory model?
 ///
-/// **Needs clarifiation:** Is loading a place that has its variant index set well-formed? Miri
+/// **Needs clarification:** Is loading a place that has its variant index set well-formed? Miri
 /// currently implements it, but it seems like this may be something to check against in the
 /// validator.
 #[derive(Clone, PartialEq, TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
@@ -1097,7 +1114,7 @@ pub enum Rvalue<'tcx> {
     CheckedBinaryOp(BinOp, Box<(Operand<'tcx>, Operand<'tcx>)>),
 
     /// Computes a value as described by the operation.
-    NullaryOp(NullOp, Ty<'tcx>),
+    NullaryOp(NullOp<'tcx>, Ty<'tcx>),
 
     /// Exactly like `BinaryOp`, but less operands.
     ///
@@ -1193,12 +1210,14 @@ pub enum AggregateKind<'tcx> {
     Generator(DefId, SubstsRef<'tcx>, hir::Movability),
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
-pub enum NullOp {
+#[derive(Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
+pub enum NullOp<'tcx> {
     /// Returns the size of a value of that type
     SizeOf,
     /// Returns the minimum alignment of a type
     AlignOf,
+    /// Returns the offset of a field
+    OffsetOf(&'tcx List<FieldIdx>),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

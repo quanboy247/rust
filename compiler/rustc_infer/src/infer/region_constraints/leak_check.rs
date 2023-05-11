@@ -5,7 +5,7 @@ use rustc_data_structures::{
     graph::{scc::Sccs, vec_graph::VecGraph},
     undo_log::UndoLogs,
 };
-use rustc_index::vec::Idx;
+use rustc_index::Idx;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::relate::RelateResult;
 
@@ -290,9 +290,9 @@ impl<'me, 'tcx> LeakCheck<'me, 'tcx> {
     ) -> TypeError<'tcx> {
         debug!("error: placeholder={:?}, other_region={:?}", placeholder, other_region);
         if self.overly_polymorphic {
-            TypeError::RegionsOverlyPolymorphic(placeholder.name, other_region)
+            TypeError::RegionsOverlyPolymorphic(placeholder.bound.kind, other_region)
         } else {
-            TypeError::RegionsInsufficientlyPolymorphic(placeholder.name, other_region)
+            TypeError::RegionsInsufficientlyPolymorphic(placeholder.bound.kind, other_region)
         }
     }
 }

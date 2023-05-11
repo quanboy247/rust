@@ -16,6 +16,7 @@ use super::{
 };
 use super::{Normalized, NormalizedTy, ProjectionCacheEntry, ProjectionCacheKey};
 
+use crate::errors::InherentProjectionNormalizationOverflow;
 use crate::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use crate::infer::{InferCtxt, InferOk, LateBoundRegionConversionTime};
 use crate::traits::error_reporting::TypeErrCtxtExt as _;
@@ -370,10 +371,14 @@ pub(crate) fn needs_normalization<'tcx, T: TypeVisitable<TyCtxt<'tcx>>>(
     reveal: Reveal,
 ) -> bool {
     match reveal {
-        Reveal::UserFacing => value
-            .has_type_flags(ty::TypeFlags::HAS_TY_PROJECTION | ty::TypeFlags::HAS_CT_PROJECTION),
+        Reveal::UserFacing => value.has_type_flags(
+            ty::TypeFlags::HAS_TY_PROJECTION
+                | ty::TypeFlags::HAS_TY_INHERENT
+                | ty::TypeFlags::HAS_CT_PROJECTION,
+        ),
         Reveal::All => value.has_type_flags(
             ty::TypeFlags::HAS_TY_PROJECTION
+                | ty::TypeFlags::HAS_TY_INHERENT
                 | ty::TypeFlags::HAS_TY_OPAQUE
                 | ty::TypeFlags::HAS_CT_PROJECTION,
         ),
@@ -616,6 +621,51 @@ impl<'a, 'b, 'tcx> TypeFolder<TyCtxt<'tcx>> for AssocTypeNormalizer<'a, 'b, 'tcx
                 );
                 normalized_ty
             }
+
+            ty::Inherent if !data.has_escaping_bound_vars() => {
+                // This branch is *mostly* just an optimization: when we don't
+                // have escaping bound vars, we don't need to replace them with
+                // placeholders (see branch below). *Also*, we know that we can
+                // register an obligation to *later* project, since we know
+                // there won't be bound vars there.
+
+                let data = data.fold_with(self);
+
+                // FIXME(inherent_associated_types): Do we need to honor `self.eager_inference_replacement`
+                // here like `ty::Projection`?
+                normalize_inherent_projection(
+                    self.selcx,
+                    self.param_env,
+                    data,
+                    self.cause.clone(),
+                    self.depth,
+                    &mut self.obligations,
+                )
+            }
+
+            ty::Inherent => {
+                let infcx = self.selcx.infcx;
+                let (data, mapped_regions, mapped_types, mapped_consts) =
+                    BoundVarReplacer::replace_bound_vars(infcx, &mut self.universes, data);
+                let data = data.fold_with(self);
+                let ty = normalize_inherent_projection(
+                    self.selcx,
+                    self.param_env,
+                    data,
+                    self.cause.clone(),
+                    self.depth,
+                    &mut self.obligations,
+                );
+
+                PlaceholderReplacer::replace_placeholders(
+                    infcx,
+                    mapped_regions,
+                    mapped_types,
+                    mapped_consts,
+                    &self.universes,
+                    ty,
+                )
+            }
         }
     }
 
@@ -772,7 +822,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for BoundVarReplacer<'_, 'tcx> {
             }
             ty::ReLateBound(debruijn, br) if debruijn >= self.current_index => {
                 let universe = self.universe_for(debruijn);
-                let p = ty::PlaceholderRegion { universe, name: br.kind };
+                let p = ty::PlaceholderRegion { universe, bound: br };
                 self.mapped_regions.insert(p, br);
                 self.infcx.tcx.mk_re_placeholder(p)
             }
@@ -790,7 +840,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for BoundVarReplacer<'_, 'tcx> {
             }
             ty::Bound(debruijn, bound_ty) if debruijn >= self.current_index => {
                 let universe = self.universe_for(debruijn);
-                let p = ty::PlaceholderType { universe, name: bound_ty.kind };
+                let p = ty::PlaceholderType { universe, bound: bound_ty };
                 self.mapped_types.insert(p, bound_ty);
                 self.infcx.tcx.mk_placeholder(p)
             }
@@ -809,7 +859,7 @@ impl<'tcx> TypeFolder<TyCtxt<'tcx>> for BoundVarReplacer<'_, 'tcx> {
             }
             ty::ConstKind::Bound(debruijn, bound_const) if debruijn >= self.current_index => {
                 let universe = self.universe_for(debruijn);
-                let p = ty::PlaceholderConst { universe, name: bound_const };
+                let p = ty::PlaceholderConst { universe, bound: bound_const };
                 self.mapped_consts.insert(p, bound_const);
                 self.infcx.tcx.mk_const(p, ct.ty())
             }
@@ -1204,6 +1254,115 @@ fn normalize_to_error<'a, 'tcx>(
     Normalized { value: new_value, obligations: vec![trait_obligation] }
 }
 
+/// Confirm and normalize the given inherent projection.
+#[instrument(level = "debug", skip(selcx, param_env, cause, obligations))]
+pub fn normalize_inherent_projection<'a, 'b, 'tcx>(
+    selcx: &'a mut SelectionContext<'b, 'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
+    alias_ty: ty::AliasTy<'tcx>,
+    cause: ObligationCause<'tcx>,
+    depth: usize,
+    obligations: &mut Vec<PredicateObligation<'tcx>>,
+) -> Ty<'tcx> {
+    let tcx = selcx.tcx();
+
+    if !tcx.recursion_limit().value_within_limit(depth) {
+        // Halt compilation because it is important that overflows never be masked.
+        tcx.sess.emit_fatal(InherentProjectionNormalizationOverflow {
+            span: cause.span,
+            ty: alias_ty.to_string(),
+        });
+    }
+
+    let substs = compute_inherent_assoc_ty_substs(
+        selcx,
+        param_env,
+        alias_ty,
+        cause.clone(),
+        depth,
+        obligations,
+    );
+
+    // Register the obligations arising from the impl and from the associated type itself.
+    let predicates = tcx.predicates_of(alias_ty.def_id).instantiate(tcx, substs);
+    for (predicate, span) in predicates {
+        let predicate = normalize_with_depth_to(
+            selcx,
+            param_env,
+            cause.clone(),
+            depth + 1,
+            predicate,
+            obligations,
+        );
+
+        let nested_cause = ObligationCause::new(
+            cause.span,
+            cause.body_id,
+            // FIXME(inherent_associated_types): Since we can't pass along the self type to the
+            // cause code, inherent projections will be printed with identity substitutions in
+            // diagnostics which is not ideal.
+            // Consider creating separate cause codes for this specific situation.
+            if span.is_dummy() {
+                super::ItemObligation(alias_ty.def_id)
+            } else {
+                super::BindingObligation(alias_ty.def_id, span)
+            },
+        );
+
+        obligations.push(Obligation::with_depth(
+            tcx,
+            nested_cause,
+            depth + 1,
+            param_env,
+            predicate,
+        ));
+    }
+
+    let ty = tcx.type_of(alias_ty.def_id).subst(tcx, substs);
+
+    let mut ty = selcx.infcx.resolve_vars_if_possible(ty);
+    if ty.has_projections() {
+        ty = normalize_with_depth_to(selcx, param_env, cause.clone(), depth + 1, ty, obligations);
+    }
+
+    ty
+}
+
+pub fn compute_inherent_assoc_ty_substs<'a, 'b, 'tcx>(
+    selcx: &'a mut SelectionContext<'b, 'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
+    alias_ty: ty::AliasTy<'tcx>,
+    cause: ObligationCause<'tcx>,
+    depth: usize,
+    obligations: &mut Vec<PredicateObligation<'tcx>>,
+) -> ty::SubstsRef<'tcx> {
+    let tcx = selcx.tcx();
+
+    let impl_def_id = tcx.parent(alias_ty.def_id);
+    let impl_substs = selcx.infcx.fresh_substs_for_item(cause.span, impl_def_id);
+
+    let impl_ty = tcx.type_of(impl_def_id).subst(tcx, impl_substs);
+    let impl_ty =
+        normalize_with_depth_to(selcx, param_env, cause.clone(), depth + 1, impl_ty, obligations);
+
+    // Infer the generic parameters of the impl by unifying the
+    // impl type with the self type of the projection.
+    let self_ty = alias_ty.self_ty();
+    match selcx.infcx.at(&cause, param_env).eq(DefineOpaqueTypes::No, impl_ty, self_ty) {
+        Ok(mut ok) => obligations.append(&mut ok.obligations),
+        Err(_) => {
+            tcx.sess.delay_span_bug(
+                cause.span,
+                format!(
+                    "{self_ty:?} was a subtype of {impl_ty:?} during selection but now it is not"
+                ),
+            );
+        }
+    }
+
+    alias_ty.rebase_substs_onto_impl(impl_substs, tcx)
+}
+
 enum Projected<'tcx> {
     Progress(Progress<'tcx>),
     NoProgress(ty::Term<'tcx>),
@@ -1272,14 +1431,29 @@ fn project<'cx, 'tcx>(
         ProjectionCandidateSet::Single(candidate) => {
             Ok(Projected::Progress(confirm_candidate(selcx, obligation, candidate)))
         }
-        ProjectionCandidateSet::None => Ok(Projected::NoProgress(
-            // FIXME(associated_const_generics): this may need to change in the future?
-            // need to investigate whether or not this is fine.
-            selcx
-                .tcx()
-                .mk_projection(obligation.predicate.def_id, obligation.predicate.substs)
-                .into(),
-        )),
+        ProjectionCandidateSet::None => {
+            let tcx = selcx.tcx();
+            let term = match tcx.def_kind(obligation.predicate.def_id) {
+                DefKind::AssocTy | DefKind::ImplTraitPlaceholder => tcx
+                    .mk_projection(obligation.predicate.def_id, obligation.predicate.substs)
+                    .into(),
+                DefKind::AssocConst => tcx
+                    .mk_const(
+                        ty::ConstKind::Unevaluated(ty::UnevaluatedConst::new(
+                            obligation.predicate.def_id,
+                            obligation.predicate.substs,
+                        )),
+                        tcx.type_of(obligation.predicate.def_id)
+                            .subst(tcx, obligation.predicate.substs),
+                    )
+                    .into(),
+                kind => {
+                    bug!("unknown projection def-id: {}", kind.descr(obligation.predicate.def_id))
+                }
+            };
+
+            Ok(Projected::NoProgress(term))
+        }
         // Error occurred while trying to processing impls.
         ProjectionCandidateSet::Error(e) => Err(ProjectionError::TraitSelectionError(e)),
         // Inherent ambiguity that prevents us from even enumerating the
@@ -1304,7 +1478,7 @@ fn assemble_candidate_for_impl_trait_in_trait<'cx, 'tcx>(
         let trait_substs =
             obligation.predicate.substs.truncate_to(tcx, tcx.generics_of(trait_def_id));
         // FIXME(named-returns): Binders
-        let trait_predicate = ty::Binder::dummy(tcx.mk_trait_ref(trait_def_id, trait_substs));
+        let trait_predicate = ty::TraitRef::new(tcx, trait_def_id, trait_substs);
 
         let _ = selcx.infcx.commit_if_ok(|_| {
             match selcx.select(&obligation.with(tcx, trait_predicate)) {
@@ -1667,10 +1841,8 @@ fn assemble_candidates_from_impls<'cx, 'tcx>(
                             if selcx.infcx.predicate_must_hold_modulo_regions(
                                 &obligation.with(
                                     selcx.tcx(),
-                                    ty::Binder::dummy(
-                                        selcx.tcx().at(obligation.cause.span()).mk_trait_ref(LangItem::Sized, [self_ty]),
-                                    )
-                                    .without_const(),
+                                    ty::TraitRef::from_lang_item(selcx.tcx(), LangItem::Sized, obligation.cause.span(),[self_ty])
+                                        .without_const(),
                                 ),
                             ) =>
                         {
@@ -1734,7 +1906,7 @@ fn assemble_candidates_from_impls<'cx, 'tcx>(
                 // These traits have no associated types.
                 selcx.tcx().sess.delay_span_bug(
                     obligation.cause.span,
-                    &format!("Cannot project an associated type from `{:?}`", impl_source),
+                    format!("Cannot project an associated type from `{:?}`", impl_source),
                 );
                 return Err(());
             }
@@ -1933,8 +2105,11 @@ fn confirm_builtin_candidate<'cx, 'tcx>(
             )
         });
         if check_is_sized {
-            let sized_predicate = ty::Binder::dummy(
-                tcx.at(obligation.cause.span()).mk_trait_ref(LangItem::Sized, [self_ty]),
+            let sized_predicate = ty::TraitRef::from_lang_item(
+                tcx,
+                LangItem::Sized,
+                obligation.cause.span(),
+                [self_ty],
             )
             .without_const();
             obligations.push(obligation.with(tcx, sized_predicate));
@@ -2131,9 +2306,8 @@ fn confirm_impl_candidate<'cx, 'tcx>(
     let ty = tcx.type_of(assoc_ty.item.def_id);
     let is_const = matches!(tcx.def_kind(assoc_ty.item.def_id), DefKind::AssocConst);
     let term: ty::EarlyBinder<ty::Term<'tcx>> = if is_const {
-        let identity_substs =
-            crate::traits::InternalSubsts::identity_for_item(tcx, assoc_ty.item.def_id);
-        let did = ty::WithOptConstParam::unknown(assoc_ty.item.def_id);
+        let did = assoc_ty.item.def_id;
+        let identity_substs = crate::traits::InternalSubsts::identity_for_item(tcx, did);
         let kind = ty::ConstKind::Unevaluated(ty::UnevaluatedConst::new(did, identity_substs));
         ty.map_bound(|ty| tcx.mk_const(kind, ty).into())
     } else {
@@ -2277,11 +2451,10 @@ fn confirm_impl_trait_in_trait_candidate<'tcx>(
         obligation.param_env,
         cause.clone(),
         obligation.recursion_depth + 1,
-        tcx.bound_return_position_impl_trait_in_trait_tys(impl_fn_def_id)
-            .map_bound(|tys| {
-                tys.map_or_else(|guar| tcx.ty_error(guar), |tys| tys[&obligation.predicate.def_id])
-            })
-            .subst(tcx, impl_fn_substs),
+        tcx.collect_return_position_impl_trait_in_trait_tys(impl_fn_def_id).map_or_else(
+            |guar| tcx.ty_error(guar),
+            |tys| tys[&obligation.predicate.def_id].subst(tcx, impl_fn_substs),
+        ),
         &mut obligations,
     );
 

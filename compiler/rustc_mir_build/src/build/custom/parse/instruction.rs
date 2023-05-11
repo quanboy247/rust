@@ -56,7 +56,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                 Ok(TerminatorKind::Drop {
                     place: self.parse_place(args[0])?,
                     target: self.parse_block(args[1])?,
-                    unwind: None,
+                    unwind: UnwindAction::Continue,
                 })
             },
             @call("mir_call", args) => {
@@ -126,7 +126,7 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                     args,
                     destination,
                     target: Some(target),
-                    cleanup: None,
+                    unwind: UnwindAction::Continue,
                     from_hir_call: *from_hir_call,
                     fn_span: *fn_span,
                 })
@@ -147,6 +147,11 @@ impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
                         *op, Box::new((self.parse_operand(*lhs)?, self.parse_operand(*rhs)?))
                     )),
                 )
+            },
+            @call("mir_offset", args) => {
+                let ptr = self.parse_operand(args[0])?;
+                let offset = self.parse_operand(args[1])?;
+                Ok(Rvalue::BinaryOp(BinOp::Offset, Box::new((ptr, offset))))
             },
             @call("mir_len", args) => Ok(Rvalue::Len(self.parse_place(args[0])?)),
             ExprKind::Borrow { borrow_kind, arg } => Ok(

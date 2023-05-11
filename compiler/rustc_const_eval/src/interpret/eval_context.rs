@@ -5,7 +5,7 @@ use std::mem;
 use either::{Either, Left, Right};
 
 use rustc_hir::{self as hir, def_id::DefId, definitions::DefPathData};
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::{ErrorHandled, InterpError};
 use rustc_middle::ty::layout::{
@@ -132,22 +132,10 @@ pub struct Frame<'mir, 'tcx, Prov: Provenance = AllocId, Extra = ()> {
 }
 
 /// What we store about a frame in an interpreter backtrace.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FrameInfo<'tcx> {
     pub instance: ty::Instance<'tcx>,
     pub span: Span,
-    pub lint_root: Option<hir::HirId>,
-}
-
-/// Unwind information.
-#[derive(Clone, Copy, Eq, PartialEq, Debug)]
-pub enum StackPopUnwind {
-    /// The cleanup block.
-    Cleanup(mir::BasicBlock),
-    /// No cleanup needs to be done.
-    Skip,
-    /// Unwinding is not allowed (UB).
-    NotAllowed,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)] // Miri debug-prints these
@@ -157,7 +145,7 @@ pub enum StackPopCleanup {
     /// we can validate it at that layout.
     /// `ret` stores the block we jump to on a normal return, while `unwind`
     /// stores the block used for cleanup during unwinding.
-    Goto { ret: Option<mir::BasicBlock>, unwind: StackPopUnwind },
+    Goto { ret: Option<mir::BasicBlock>, unwind: mir::UnwindAction },
     /// The root frame of the stack: nowhere else to jump to.
     /// `cleanup` says whether locals are deallocated. Static computation
     /// wants them leaked to intern what they need (and just throw away
@@ -473,10 +461,10 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         instance: ty::InstanceDef<'tcx>,
         promoted: Option<mir::Promoted>,
     ) -> InterpResult<'tcx, &'tcx mir::Body<'tcx>> {
-        let def = instance.with_opt_param();
         trace!("load mir(instance={:?}, promoted={:?})", instance, promoted);
         let body = if let Some(promoted) = promoted {
-            &self.tcx.promoted_mir_opt_const_arg(def)[promoted]
+            let def = instance.def_id();
+            &self.tcx.promoted_mir(def)[promoted]
         } else {
             M::load_mir(self, instance)?
         };
@@ -507,20 +495,24 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     ) -> Result<T, InterpError<'tcx>> {
         frame
             .instance
-            .try_subst_mir_and_normalize_erasing_regions(*self.tcx, self.param_env, value)
+            .try_subst_mir_and_normalize_erasing_regions(
+                *self.tcx,
+                self.param_env,
+                ty::EarlyBinder(value),
+            )
             .map_err(|_| err_inval!(TooGeneric))
     }
 
     /// The `substs` are assumed to already be in our interpreter "universe" (param_env).
     pub(super) fn resolve(
         &self,
-        def: ty::WithOptConstParam<DefId>,
+        def: DefId,
         substs: SubstsRef<'tcx>,
     ) -> InterpResult<'tcx, ty::Instance<'tcx>> {
         trace!("resolve: {:?}, {:#?}", def, substs);
         trace!("param_env: {:#?}", self.param_env);
         trace!("substs: {:#?}", substs);
-        match ty::Instance::resolve_opt_const_arg(*self.tcx, self.param_env, def, substs) {
+        match ty::Instance::resolve(*self.tcx, self.param_env, def, substs) {
             Ok(Some(instance)) => Ok(instance),
             Ok(None) => throw_inval!(TooGeneric),
 
@@ -735,17 +727,21 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// *Unwind* to the given `target` basic block.
     /// Do *not* use for returning! Use `return_to_block` instead.
     ///
-    /// If `target` is `StackPopUnwind::Skip`, that indicates the function does not need cleanup
+    /// If `target` is `UnwindAction::Continue`, that indicates the function does not need cleanup
     /// during unwinding, and we will just keep propagating that upwards.
     ///
-    /// If `target` is `StackPopUnwind::NotAllowed`, that indicates the function does not allow
+    /// If `target` is `UnwindAction::Unreachable`, that indicates the function does not allow
     /// unwinding, and doing so is UB.
-    pub fn unwind_to_block(&mut self, target: StackPopUnwind) -> InterpResult<'tcx> {
+    pub fn unwind_to_block(&mut self, target: mir::UnwindAction) -> InterpResult<'tcx> {
         self.frame_mut().loc = match target {
-            StackPopUnwind::Cleanup(block) => Left(mir::Location { block, statement_index: 0 }),
-            StackPopUnwind::Skip => Right(self.frame_mut().body.span),
-            StackPopUnwind::NotAllowed => {
+            mir::UnwindAction::Cleanup(block) => Left(mir::Location { block, statement_index: 0 }),
+            mir::UnwindAction::Continue => Right(self.frame_mut().body.span),
+            mir::UnwindAction::Unreachable => {
                 throw_ub_format!("unwinding past a stack frame that does not allow unwinding")
+            }
+            mir::UnwindAction::Terminate => {
+                self.frame_mut().loc = Right(self.frame_mut().body.span);
+                M::abort(self, "panic in a function that cannot unwind".to_owned())?;
             }
         };
         Ok(())
@@ -954,10 +950,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         // This deliberately does *not* honor `requires_caller_location` since it is used for much
         // more than just panics.
         for frame in stack.iter().rev() {
-            let lint_root = frame.lint_root();
             let span = frame.current_span();
-
-            frames.push(FrameInfo { span, instance: frame.instance, lint_root });
+            frames.push(FrameInfo { span, instance: frame.instance });
         }
         trace!("generate stacktrace: {:#?}", frames);
         frames

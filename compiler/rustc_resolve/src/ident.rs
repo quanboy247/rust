@@ -13,18 +13,19 @@ use rustc_span::{Span, DUMMY_SP};
 
 use std::ptr;
 
+use crate::errors::{ParamKindInEnumDiscriminant, ParamKindInNonTrivialAnonConst};
 use crate::late::{
-    ConstantHasGenerics, ConstantItemKind, HasGenericParams, PathSource, Rib, RibKind,
+    ConstantHasGenerics, ConstantItemKind, HasGenericParams, NoConstantGenericsReason, PathSource,
+    Rib, RibKind,
 };
 use crate::macros::{sub_namespace_match, MacroRulesScope};
-use crate::{AmbiguityError, AmbiguityErrorMisc, AmbiguityKind, Determinacy, Finalize};
+use crate::{errors, AmbiguityError, AmbiguityErrorMisc, AmbiguityKind, Determinacy, Finalize};
 use crate::{Import, ImportKind, LexicalScopeBinding, Module, ModuleKind, ModuleOrUniformRoot};
 use crate::{NameBinding, NameBindingKind, ParentScope, PathResult, PrivacyError, Res};
 use crate::{ResolutionError, Resolver, Scope, ScopeSet, Segment, ToNameBinding, Weak};
 
 use Determinacy::*;
 use Namespace::*;
-use RibKind::*;
 
 type Visibility = ty::Visibility<LocalDefId>;
 
@@ -324,8 +325,8 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             }
 
             module = match ribs[i].kind {
-                ModuleRibKind(module) => module,
-                MacroDefinition(def) if def == self.macro_def(ident.span.ctxt()) => {
+                RibKind::Module(module) => module,
+                RibKind::MacroDefinition(def) if def == self.macro_def(ident.span.ctxt()) => {
                     // If an invocation of this macro created `ident`, give up on `ident`
                     // and switch to `ident`'s source from the macro definition.
                     ident.span.remove_mark();
@@ -527,7 +528,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                                         PROC_MACRO_DERIVE_RESOLUTION_FALLBACK,
                                         lint_id,
                                         orig_ident.span,
-                                        &format!(
+                                        format!(
                                             "cannot find {} `{}` in this scope",
                                             ns.descr(),
                                             ident
@@ -1084,7 +1085,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         let ribs = &all_ribs[rib_index + 1..];
 
         // An invalid forward use of a generic parameter from a previous default.
-        if let ForwardGenericParamBanRibKind = all_ribs[rib_index].kind {
+        if let RibKind::ForwardGenericParamBan = all_ribs[rib_index].kind {
             if let Some(span) = finalize {
                 let res_error = if rib_ident.name == kw::SelfUpper {
                     ResolutionError::SelfInGenericParamDefault
@@ -1104,14 +1105,14 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
 
                 for rib in ribs {
                     match rib.kind {
-                        NormalRibKind
-                        | ClosureOrAsyncRibKind
-                        | ModuleRibKind(..)
-                        | MacroDefinition(..)
-                        | ForwardGenericParamBanRibKind => {
+                        RibKind::Normal
+                        | RibKind::ClosureOrAsync
+                        | RibKind::Module(..)
+                        | RibKind::MacroDefinition(..)
+                        | RibKind::ForwardGenericParamBan => {
                             // Nothing to do. Continue.
                         }
-                        ItemRibKind(_) | AssocItemRibKind => {
+                        RibKind::Item(_) | RibKind::AssocItem => {
                             // This was an attempt to access an upvar inside a
                             // named function item. This is not allowed, so we
                             // report an error.
@@ -1123,7 +1124,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                                 res_err = Some((span, CannotCaptureDynamicEnvironmentInFnItem));
                             }
                         }
-                        ConstantItemRibKind(_, item) => {
+                        RibKind::ConstantItem(_, item) => {
                             // Still doesn't deal with upvars
                             if let Some(span) = finalize {
                                 let (span, resolution_error) =
@@ -1152,13 +1153,19 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                             }
                             return Res::Err;
                         }
-                        ConstParamTyRibKind => {
+                        RibKind::ConstParamTy => {
                             if let Some(span) = finalize {
-                                self.report_error(span, ParamInTyOfConstParam(rib_ident.name));
+                                self.report_error(
+                                    span,
+                                    ParamInTyOfConstParam {
+                                        name: rib_ident.name,
+                                        param_kind: None,
+                                    },
+                                );
                             }
                             return Res::Err;
                         }
-                        InlineAsmSymRibKind => {
+                        RibKind::InlineAsmSym => {
                             if let Some(span) = finalize {
                                 self.report_error(span, InvalidAsmSym);
                             }
@@ -1171,26 +1178,25 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                     return Res::Err;
                 }
             }
-            Res::Def(DefKind::TyParam, _) | Res::SelfTyParam { .. } | Res::SelfTyAlias { .. } => {
+            Res::Def(DefKind::TyParam, _)
+            | Res::SelfTyParam { .. }
+            | Res::SelfTyAlias { .. }
+            | Res::SelfCtor(_) => {
                 for rib in ribs {
                     let has_generic_params: HasGenericParams = match rib.kind {
-                        NormalRibKind
-                        | ClosureOrAsyncRibKind
-                        | ModuleRibKind(..)
-                        | MacroDefinition(..)
-                        | InlineAsmSymRibKind
-                        | AssocItemRibKind
-                        | ForwardGenericParamBanRibKind => {
+                        RibKind::Normal
+                        | RibKind::ClosureOrAsync
+                        | RibKind::Module(..)
+                        | RibKind::MacroDefinition(..)
+                        | RibKind::InlineAsmSym
+                        | RibKind::AssocItem
+                        | RibKind::ForwardGenericParamBan => {
                             // Nothing to do. Continue.
                             continue;
                         }
 
-                        ConstantItemRibKind(trivial, _) => {
-                            let features = self.tcx.sess.features_untracked();
-                            // HACK(min_const_generics): We currently only allow `N` or `{ N }`.
-                            if !(trivial == ConstantHasGenerics::Yes
-                                || features.generic_const_exprs)
-                            {
+                        RibKind::ConstantItem(trivial, _) => {
+                            if let ConstantHasGenerics::No(cause) = trivial {
                                 // HACK(min_const_generics): If we encounter `Self` in an anonymous
                                 // constant we can't easily tell if it's generic at this stage, so
                                 // we instead remember this and then enforce the self type to be
@@ -1208,13 +1214,22 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                                     }
                                 } else {
                                     if let Some(span) = finalize {
-                                        self.report_error(
-                                            span,
-                                            ResolutionError::ParamInNonTrivialAnonConst {
-                                                name: rib_ident.name,
-                                                is_type: true,
-                                            },
-                                        );
+                                        let error = match cause {
+                                            NoConstantGenericsReason::IsEnumDiscriminant => {
+                                                ResolutionError::ParamInEnumDiscriminant {
+                                                    name: rib_ident.name,
+                                                    param_kind: ParamKindInEnumDiscriminant::Type,
+                                                }
+                                            }
+                                            NoConstantGenericsReason::NonTrivialConstArg => {
+                                                ResolutionError::ParamInNonTrivialAnonConst {
+                                                    name: rib_ident.name,
+                                                    param_kind:
+                                                        ParamKindInNonTrivialAnonConst::Type,
+                                                }
+                                            }
+                                        };
+                                        self.report_error(span, error);
                                         self.tcx.sess.delay_span_bug(span, CG_BUG_STR);
                                     }
 
@@ -1226,12 +1241,15 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         }
 
                         // This was an attempt to use a type parameter outside its scope.
-                        ItemRibKind(has_generic_params) => has_generic_params,
-                        ConstParamTyRibKind => {
+                        RibKind::Item(has_generic_params) => has_generic_params,
+                        RibKind::ConstParamTy => {
                             if let Some(span) = finalize {
                                 self.report_error(
                                     span,
-                                    ResolutionError::ParamInTyOfConstParam(rib_ident.name),
+                                    ResolutionError::ParamInTyOfConstParam {
+                                        name: rib_ident.name,
+                                        param_kind: Some(errors::ParamKindInTyOfConstParam::Type),
+                                    },
                                 );
                             }
                             return Res::Err;
@@ -1253,29 +1271,34 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
             Res::Def(DefKind::ConstParam, _) => {
                 for rib in ribs {
                     let has_generic_params = match rib.kind {
-                        NormalRibKind
-                        | ClosureOrAsyncRibKind
-                        | ModuleRibKind(..)
-                        | MacroDefinition(..)
-                        | InlineAsmSymRibKind
-                        | AssocItemRibKind
-                        | ForwardGenericParamBanRibKind => continue,
+                        RibKind::Normal
+                        | RibKind::ClosureOrAsync
+                        | RibKind::Module(..)
+                        | RibKind::MacroDefinition(..)
+                        | RibKind::InlineAsmSym
+                        | RibKind::AssocItem
+                        | RibKind::ForwardGenericParamBan => continue,
 
-                        ConstantItemRibKind(trivial, _) => {
-                            let features = self.tcx.sess.features_untracked();
-                            // HACK(min_const_generics): We currently only allow `N` or `{ N }`.
-                            if !(trivial == ConstantHasGenerics::Yes
-                                || features.generic_const_exprs)
-                            {
+                        RibKind::ConstantItem(trivial, _) => {
+                            if let ConstantHasGenerics::No(cause) = trivial {
                                 if let Some(span) = finalize {
-                                    self.report_error(
-                                        span,
-                                        ResolutionError::ParamInNonTrivialAnonConst {
-                                            name: rib_ident.name,
-                                            is_type: false,
-                                        },
-                                    );
-                                    self.tcx.sess.delay_span_bug(span, CG_BUG_STR);
+                                    let error = match cause {
+                                        NoConstantGenericsReason::IsEnumDiscriminant => {
+                                            ResolutionError::ParamInEnumDiscriminant {
+                                                name: rib_ident.name,
+                                                param_kind: ParamKindInEnumDiscriminant::Const,
+                                            }
+                                        }
+                                        NoConstantGenericsReason::NonTrivialConstArg => {
+                                            ResolutionError::ParamInNonTrivialAnonConst {
+                                                name: rib_ident.name,
+                                                param_kind: ParamKindInNonTrivialAnonConst::Const {
+                                                    name: rib_ident.name,
+                                                },
+                                            }
+                                        }
+                                    };
+                                    self.report_error(span, error);
                                 }
 
                                 return Res::Err;
@@ -1284,12 +1307,15 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                             continue;
                         }
 
-                        ItemRibKind(has_generic_params) => has_generic_params,
-                        ConstParamTyRibKind => {
+                        RibKind::Item(has_generic_params) => has_generic_params,
+                        RibKind::ConstParamTy => {
                             if let Some(span) = finalize {
                                 self.report_error(
                                     span,
-                                    ResolutionError::ParamInTyOfConstParam(rib_ident.name),
+                                    ResolutionError::ParamInTyOfConstParam {
+                                        name: rib_ident.name,
+                                        param_kind: Some(errors::ParamKindInTyOfConstParam::Const),
+                                    },
                                 );
                             }
                             return Res::Err;
@@ -1345,7 +1371,13 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         ribs: Option<&PerNS<Vec<Rib<'a>>>>,
         ignore_binding: Option<&'a NameBinding<'a>>,
     ) -> PathResult<'a> {
-        debug!("resolve_path(path={:?}, opt_ns={:?}, finalize={:?})", path, opt_ns, finalize);
+        debug!(
+            "resolve_path(path={:?}, opt_ns={:?}, finalize={:?}) path_len: {}",
+            path,
+            opt_ns,
+            finalize,
+            path.len()
+        );
 
         let mut module = None;
         let mut allow_super = true;
@@ -1364,7 +1396,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 }
             };
 
-            let is_last = i == path.len() - 1;
+            let is_last = i + 1 == path.len();
             let ns = if is_last { opt_ns.unwrap_or(TypeNS) } else { TypeNS };
             let name = ident.name;
 
@@ -1501,16 +1533,12 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                     if let Some(next_module) = binding.module() {
                         module = Some(ModuleOrUniformRoot::Module(next_module));
                         record_segment_res(self, res);
-                    } else if res == Res::ToolMod && i + 1 != path.len() {
+                    } else if res == Res::ToolMod && !is_last && opt_ns.is_some() {
                         if binding.is_import() {
-                            self.tcx
-                                .sess
-                                .struct_span_err(
-                                    ident.span,
-                                    "cannot use a tool module through an import",
-                                )
-                                .span_note(binding.span, "the tool module imported here")
-                                .emit();
+                            self.tcx.sess.emit_err(errors::ToolModuleImported {
+                                span: ident.span,
+                                import: binding.span,
+                            });
                         }
                         let res = Res::NonMacroAttr(NonMacroAttrKind::Tool);
                         return PathResult::NonModule(PartialRes::new(res));

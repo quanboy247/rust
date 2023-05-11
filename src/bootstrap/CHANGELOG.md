@@ -17,6 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `remote-test-server`'s `remote` argument has been removed in favor of the `--bind` flag. Use `--bind 0.0.0.0:12345` to replicate the behavior of the `remote` argument.
 - `x.py fmt` now formats only files modified between the merge-base of HEAD and the last commit in the master branch of the rust-lang repository and the current working directory. To restore old behaviour, use `x.py fmt .`. The check mode is not affected by this change. [#105702](https://github.com/rust-lang/rust/pull/105702)
 - The `llvm.version-check` config option has been removed. Older versions were never supported. If you still need to support older versions (e.g. you are applying custom patches), patch `check_llvm_version` in bootstrap to change the minimum version. [#108619](https://github.com/rust-lang/rust/pull/108619)
+- The `rust.ignore-git` option has been renamed to `rust.omit-git-hash`. [#110059](https://github.com/rust-lang/rust/pull/110059)
 
 ### Non-breaking changes
 
@@ -26,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   from the default rust toolchain. [#78513](https://github.com/rust-lang/rust/pull/78513)
 - Add options for enabling overflow checks, one for std (`overflow-checks-std`) and one for everything else (`overflow-checks`). Both default to false.
 - Add llvm option `enable-warnings` to have control on llvm compilation warnings. Default to false.
+- Add `rpath` option in `target` section to support set rpath option for each target independently. [#111242](https://github.com/rust-lang/rust/pull/111242)
 
 
 ## [Version 2] - 2020-09-25

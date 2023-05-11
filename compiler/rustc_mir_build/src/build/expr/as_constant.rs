@@ -78,7 +78,7 @@ pub fn as_constant_inner<'tcx>(
         ExprKind::NamedConst { def_id, substs, ref user_ty } => {
             let user_ty = user_ty.as_ref().and_then(push_cuta);
 
-            let uneval = mir::UnevaluatedConst::new(ty::WithOptConstParam::unknown(def_id), substs);
+            let uneval = mir::UnevaluatedConst::new(def_id, substs);
             let literal = ConstantKind::Unevaluated(uneval, ty);
 
             Constant { user_ty, span, literal }
@@ -90,7 +90,7 @@ pub fn as_constant_inner<'tcx>(
             Constant { user_ty: None, span, literal }
         }
         ExprKind::ConstBlock { did: def_id, substs } => {
-            let uneval = mir::UnevaluatedConst::new(ty::WithOptConstParam::unknown(def_id), substs);
+            let uneval = mir::UnevaluatedConst::new(def_id, substs);
             let literal = ConstantKind::Unevaluated(uneval, ty);
 
             Constant { user_ty: None, span, literal }
@@ -145,6 +145,12 @@ pub(crate) fn lit_to_mir_constant<'tcx>(
         (ast::LitKind::ByteStr(data, _), ty::Ref(_, inner_ty, _)) if inner_ty.is_array() => {
             let id = tcx.allocate_bytes(data);
             ConstValue::Scalar(Scalar::from_pointer(id.into(), &tcx))
+        }
+        (ast::LitKind::CStr(data, _), ty::Ref(_, inner_ty, _)) if matches!(inner_ty.kind(), ty::Adt(def, _) if Some(def.did()) == tcx.lang_items().c_str()) =>
+        {
+            let allocation = Allocation::from_bytes_byte_aligned_immutable(data as &[u8]);
+            let allocation = tcx.mk_const_alloc(allocation);
+            ConstValue::Slice { data: allocation, start: 0, end: data.len() }
         }
         (ast::LitKind::Byte(n), ty::Uint(ty::UintTy::U8)) => {
             ConstValue::Scalar(Scalar::from_uint(*n, Size::from_bytes(1)))

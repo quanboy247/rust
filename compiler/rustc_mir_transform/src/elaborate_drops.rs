@@ -1,7 +1,7 @@
 use crate::deref_separator::deref_finder;
 use crate::MirPass;
-use rustc_data_structures::fx::FxHashMap;
 use rustc_index::bit_set::BitSet;
+use rustc_index::IndexVec;
 use rustc_middle::mir::patch::MirPatch;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
@@ -24,7 +24,7 @@ use std::fmt;
 /// In general, the compiler cannot determine at compile time whether a destructor will run or not.
 ///
 /// At a high level, this pass refines Drop to only run the destructor if the
-/// target is initialized. The way this is achievied is by inserting drop flags for every variable
+/// target is initialized. The way this is achieved is by inserting drop flags for every variable
 /// that may be dropped, and then using those flags to determine whether a destructor should run.
 /// Once this is complete, Drop terminators in the MIR correspond to a call to the "drop glue" or
 /// "drop shim" for the type of the dropped place.
@@ -84,12 +84,13 @@ impl<'tcx> MirPass<'tcx> for ElaborateDrops {
 
             let reachable = traversal::reachable_as_bitset(body);
 
+            let drop_flags = IndexVec::from_elem(None, &env.move_data.move_paths);
             ElaborateDropsCtxt {
                 tcx,
                 body,
                 env: &env,
                 init_data: InitializationData { inits, uninits },
-                drop_flags: Default::default(),
+                drop_flags,
                 patch: MirPatch::new(body),
                 un_derefer: un_derefer,
                 reachable,
@@ -120,7 +121,7 @@ fn remove_dead_unwinds<'tcx>(
         .into_results_cursor(body);
     for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
         let place = match bb_data.terminator().kind {
-            TerminatorKind::Drop { ref place, unwind: Some(_), .. } => {
+            TerminatorKind::Drop { ref place, unwind: UnwindAction::Cleanup(_), .. } => {
                 und.derefer(place.as_ref(), body).unwrap_or(*place)
             }
             _ => continue,
@@ -160,7 +161,7 @@ fn remove_dead_unwinds<'tcx>(
     let basic_blocks = body.basic_blocks.as_mut();
     for &bb in dead_unwinds.iter() {
         if let Some(unwind) = basic_blocks[bb].terminator_mut().unwind_mut() {
-            *unwind = None;
+            *unwind = UnwindAction::Unreachable;
         }
     }
 }
@@ -293,7 +294,7 @@ struct ElaborateDropsCtxt<'a, 'tcx> {
     body: &'a Body<'tcx>,
     env: &'a MoveDataParamEnv<'tcx>,
     init_data: InitializationData<'a, 'tcx>,
-    drop_flags: FxHashMap<MovePathIndex, Local>,
+    drop_flags: IndexVec<MovePathIndex, Option<Local>>,
     patch: MirPatch<'tcx>,
     un_derefer: UnDerefer<'tcx>,
     reachable: BitSet<BasicBlock>,
@@ -312,11 +313,11 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         let tcx = self.tcx;
         let patch = &mut self.patch;
         debug!("create_drop_flag({:?})", self.body.span);
-        self.drop_flags.entry(index).or_insert_with(|| patch.new_internal(tcx.types.bool, span));
+        self.drop_flags[index].get_or_insert_with(|| patch.new_internal(tcx.types.bool, span));
     }
 
     fn drop_flag(&mut self, index: MovePathIndex) -> Option<Place<'tcx>> {
-        self.drop_flags.get(&index).map(|t| Place::from(*t))
+        self.drop_flags[index].map(Place::from)
     }
 
     /// create a patch that elaborates all drops in the input
@@ -365,7 +366,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
                     if maybe_dead {
                         self.tcx.sess.delay_span_bug(
                             terminator.source_info.span,
-                            &format!(
+                            format!(
                                 "drop of untracked, uninitialized value {:?}, place {:?} ({:?})",
                                 bb, place, path
                             ),
@@ -399,7 +400,6 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
             let loc = Location { block: bb, statement_index: data.statements.len() };
             let terminator = data.terminator();
 
-            let resume_block = self.patch.resume_block();
             match terminator.kind {
                 TerminatorKind::Drop { mut place, target, unwind } => {
                     if let Some(new_place) = self.un_derefer.derefer(place.as_ref(), self.body) {
@@ -408,19 +408,31 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
 
                     self.init_data.seek_before(loc);
                     match self.move_data().rev_lookup.find(place.as_ref()) {
-                        LookupResult::Exact(path) => elaborate_drop(
-                            &mut Elaborator { ctxt: self },
-                            terminator.source_info,
-                            place,
-                            path,
-                            target,
-                            if data.is_cleanup {
+                        LookupResult::Exact(path) => {
+                            let unwind = if data.is_cleanup {
                                 Unwind::InCleanup
                             } else {
-                                Unwind::To(Option::unwrap_or(unwind, resume_block))
-                            },
-                            bb,
-                        ),
+                                match unwind {
+                                    UnwindAction::Cleanup(cleanup) => Unwind::To(cleanup),
+                                    UnwindAction::Continue => Unwind::To(self.patch.resume_block()),
+                                    UnwindAction::Unreachable => {
+                                        Unwind::To(self.patch.unreachable_cleanup_block())
+                                    }
+                                    UnwindAction::Terminate => {
+                                        Unwind::To(self.patch.terminate_block())
+                                    }
+                                }
+                            };
+                            elaborate_drop(
+                                &mut Elaborator { ctxt: self },
+                                terminator.source_info,
+                                place,
+                                path,
+                                target,
+                                unwind,
+                                bb,
+                            )
+                        }
                         LookupResult::Parent(..) => {
                             if !matches!(
                                 terminator.source_info.span.desugaring_kind(),
@@ -428,7 +440,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
                             ) {
                                 self.tcx.sess.delay_span_bug(
                                     terminator.source_info.span,
-                                    &format!("drop of untracked value {:?}", bb),
+                                    format!("drop of untracked value {:?}", bb),
                                 );
                             }
                             // A drop and replace behind a pointer/array/whatever.
@@ -452,7 +464,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn set_drop_flag(&mut self, loc: Location, path: MovePathIndex, val: DropFlagState) {
-        if let Some(&flag) = self.drop_flags.get(&path) {
+        if let Some(flag) = self.drop_flags[path] {
             let span = self.patch.source_info_for_location(self.body, loc).span;
             let val = self.constant_bool(span, val.value());
             self.patch.add_assign(loc, Place::from(flag), val);
@@ -463,7 +475,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         let loc = Location::START;
         let span = self.patch.source_info_for_location(self.body, loc).span;
         let false_ = self.constant_bool(span, false);
-        for flag in self.drop_flags.values() {
+        for flag in self.drop_flags.iter().flatten() {
             self.patch.add_assign(loc, Place::from(*flag), false_.clone());
         }
     }
@@ -474,7 +486,10 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
                 continue;
             }
             if let TerminatorKind::Call {
-                destination, target: Some(tgt), cleanup: Some(_), ..
+                destination,
+                target: Some(tgt),
+                unwind: UnwindAction::Cleanup(_),
+                ..
             } = data.terminator().kind
             {
                 assert!(!self.patch.is_patched(bb));
@@ -543,8 +558,12 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
             // There may be a critical edge after this call,
             // so mark the return as initialized *before* the
             // call.
-            if let TerminatorKind::Call { destination, target: Some(_), cleanup: None, .. } =
-                data.terminator().kind
+            if let TerminatorKind::Call {
+                destination,
+                target: Some(_),
+                unwind: UnwindAction::Continue | UnwindAction::Unreachable | UnwindAction::Terminate,
+                ..
+            } = data.terminator().kind
             {
                 assert!(!self.patch.is_patched(bb));
 

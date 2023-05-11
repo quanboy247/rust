@@ -49,23 +49,23 @@ pub use self::object_safety::astconv_object_safety_violations;
 pub use self::object_safety::is_vtable_safe_method;
 pub use self::object_safety::MethodViolationCode;
 pub use self::object_safety::ObjectSafetyViolation;
-pub use self::project::{normalize_projection_type, NormalizeExt};
+pub use self::project::NormalizeExt;
+pub use self::project::{normalize_inherent_projection, normalize_projection_type};
 pub use self::select::{EvaluationCache, SelectionCache, SelectionContext};
 pub use self::select::{EvaluationResult, IntercrateAmbiguityCause, OverflowError};
 pub use self::specialize::specialization_graph::FutureCompatOverlapError;
 pub use self::specialize::specialization_graph::FutureCompatOverlapErrorKind;
-pub use self::specialize::{specialization_graph, translate_substs, OverlapError};
+pub use self::specialize::{
+    specialization_graph, translate_substs, translate_substs_with_cause, OverlapError,
+};
 pub use self::structural_match::{
     search_for_adt_const_param_violation, search_for_structural_match_violation,
 };
-pub use self::util::{
-    elaborate_obligations, elaborate_predicates, elaborate_predicates_with_span,
-    elaborate_trait_ref, elaborate_trait_refs,
-};
+pub use self::util::elaborate;
 pub use self::util::{expand_trait_aliases, TraitAliasExpander};
 pub use self::util::{get_vtable_index_of_object_method, impl_item_is_final, upcast_choices};
 pub use self::util::{
-    supertrait_def_ids, supertraits, transitive_bounds, transitive_bounds_that_define_assoc_type,
+    supertrait_def_ids, supertraits, transitive_bounds, transitive_bounds_that_define_assoc_item,
     SupertraitDefIds,
 };
 
@@ -130,7 +130,7 @@ pub fn type_known_to_meet_bound_modulo_regions<'tcx>(
     ty: Ty<'tcx>,
     def_id: DefId,
 ) -> bool {
-    let trait_ref = ty::Binder::dummy(infcx.tcx.mk_trait_ref(def_id, [ty]));
+    let trait_ref = ty::TraitRef::new(infcx.tcx, def_id, [ty]);
     pred_known_to_hold_modulo_regions(infcx, param_env, trait_ref.without_const())
 }
 
@@ -206,7 +206,7 @@ fn do_normalize_predicates<'tcx>(
         }
     };
 
-    debug!("do_normalize_predictes: normalized predicates = {:?}", predicates);
+    debug!("do_normalize_predicates: normalized predicates = {:?}", predicates);
 
     // We can use the `elaborated_env` here; the region code only
     // cares about declarations like `'a: 'b`.
@@ -267,7 +267,7 @@ pub fn normalize_param_env_or_error<'tcx>(
     // and errors will get reported then; so outside of type inference we
     // can be sure that no errors should occur.
     let mut predicates: Vec<_> =
-        util::elaborate_predicates(tcx, unnormalized_env.caller_bounds().into_iter()).collect();
+        util::elaborate(tcx, unnormalized_env.caller_bounds().into_iter()).collect();
 
     debug!("normalize_param_env_or_error: elaborated-predicates={:?}", predicates);
 
@@ -417,7 +417,7 @@ fn subst_and_check_impossible_predicates<'tcx>(
         predicates.push(ty::Binder::dummy(trait_ref).to_predicate(tcx));
     }
 
-    predicates.retain(|predicate| !predicate.needs_subst());
+    predicates.retain(|predicate| !predicate.has_param());
     let result = impossible_predicates(tcx, predicates);
 
     debug!("subst_and_check_impossible_predicates(key={:?}) = {:?}", key, result);
@@ -453,7 +453,7 @@ fn is_impossible_method(tcx: TyCtxt<'_>, (impl_def_id, trait_item_def_id): (DefI
             {
                 return ControlFlow::Break(());
             }
-            r.super_visit_with(self)
+            ControlFlow::Continue(())
         }
         fn visit_const(&mut self, ct: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
             if let ty::ConstKind::Param(param) = ct.kind()

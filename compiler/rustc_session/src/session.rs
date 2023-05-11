@@ -294,6 +294,11 @@ impl Session {
         self.crate_types.get().unwrap().as_slice()
     }
 
+    /// Returns true if the crate is a testing one.
+    pub fn is_test_crate(&self) -> bool {
+        self.opts.test
+    }
+
     pub fn needs_crate_hash(&self) -> bool {
         // Why is the crate hash needed for these configurations?
         // - debug_assertions: for the "fingerprint the result" check in
@@ -761,8 +766,28 @@ impl Session {
         self.opts.unstable_opts.sanitizer.contains(SanitizerSet::CFI)
     }
 
+    pub fn is_sanitizer_cfi_canonical_jump_tables_disabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_canonical_jump_tables == Some(false)
+    }
+
+    pub fn is_sanitizer_cfi_canonical_jump_tables_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_canonical_jump_tables == Some(true)
+    }
+
+    pub fn is_sanitizer_cfi_generalize_pointers_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_generalize_pointers == Some(true)
+    }
+
+    pub fn is_sanitizer_cfi_normalize_integers_enabled(&self) -> bool {
+        self.opts.unstable_opts.sanitizer_cfi_normalize_integers == Some(true)
+    }
+
     pub fn is_sanitizer_kcfi_enabled(&self) -> bool {
         self.opts.unstable_opts.sanitizer.contains(SanitizerSet::KCFI)
+    }
+
+    pub fn is_split_lto_unit_enabled(&self) -> bool {
+        self.opts.unstable_opts.split_lto_unit == Some(true)
     }
 
     /// Check whether this compile session and crate type use static crt.
@@ -806,7 +831,7 @@ impl Session {
     }
 
     pub fn generate_proc_macro_decls_symbol(&self, stable_crate_id: StableCrateId) -> String {
-        format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.to_u64())
+        format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.as_u64())
     }
 
     pub fn target_filesearch(&self, kind: PathKind) -> filesearch::FileSearch<'_> {
@@ -1185,6 +1210,7 @@ impl Session {
 
     /// Returns the number of query threads that should be used for this
     /// compilation
+    #[inline]
     pub fn threads(&self) -> usize {
         self.opts.unstable_opts.threads
     }
@@ -1576,22 +1602,58 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         sess.emit_err(errors::CannotEnableCrtStaticLinux);
     }
 
-    // LLVM CFI and VFE both require LTO.
-    if sess.lto() != config::Lto::Fat {
-        if sess.is_sanitizer_cfi_enabled() {
-            sess.emit_err(errors::SanitizerCfiEnabled);
-        }
-        if sess.opts.unstable_opts.virtual_function_elimination {
-            sess.emit_err(errors::UnstableVirtualFunctionElimination);
-        }
+    // LLVM CFI requires LTO.
+    if sess.is_sanitizer_cfi_enabled()
+        && !(sess.lto() == config::Lto::Fat
+            || sess.lto() == config::Lto::Thin
+            || sess.opts.cg.linker_plugin_lto.enabled())
+    {
+        sess.emit_err(errors::SanitizerCfiRequiresLto);
     }
 
-    // LLVM CFI and KCFI are mutually exclusive
+    // LLVM CFI is incompatible with LLVM KCFI.
     if sess.is_sanitizer_cfi_enabled() && sess.is_sanitizer_kcfi_enabled() {
         sess.emit_err(errors::CannotMixAndMatchSanitizers {
             first: "cfi".to_string(),
             second: "kcfi".to_string(),
         });
+    }
+
+    // Canonical jump tables requires CFI.
+    if sess.is_sanitizer_cfi_canonical_jump_tables_disabled() {
+        if !sess.is_sanitizer_cfi_enabled() {
+            sess.emit_err(errors::SanitizerCfiCanonicalJumpTablesRequiresCfi);
+        }
+    }
+
+    // LLVM CFI pointer generalization requires CFI or KCFI.
+    if sess.is_sanitizer_cfi_generalize_pointers_enabled() {
+        if !(sess.is_sanitizer_cfi_enabled() || sess.is_sanitizer_kcfi_enabled()) {
+            sess.emit_err(errors::SanitizerCfiGeneralizePointersRequiresCfi);
+        }
+    }
+
+    // LLVM CFI integer normalization requires CFI or KCFI.
+    if sess.is_sanitizer_cfi_normalize_integers_enabled() {
+        if !(sess.is_sanitizer_cfi_enabled() || sess.is_sanitizer_kcfi_enabled()) {
+            sess.emit_err(errors::SanitizerCfiNormalizeIntegersRequiresCfi);
+        }
+    }
+
+    // LTO unit splitting requires LTO.
+    if sess.is_split_lto_unit_enabled()
+        && !(sess.lto() == config::Lto::Fat
+            || sess.lto() == config::Lto::Thin
+            || sess.opts.cg.linker_plugin_lto.enabled())
+    {
+        sess.emit_err(errors::SplitLtoUnitRequiresLto);
+    }
+
+    // VFE requires LTO.
+    if sess.lto() != config::Lto::Fat {
+        if sess.opts.unstable_opts.virtual_function_elimination {
+            sess.emit_err(errors::UnstableVirtualFunctionElimination);
+        }
     }
 
     if sess.opts.unstable_opts.stack_protector != StackProtector::None {

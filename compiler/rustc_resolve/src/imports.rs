@@ -17,6 +17,7 @@ use rustc_data_structures::intern::Interned;
 use rustc_errors::{pluralize, struct_span_err, Applicability, MultiSpan};
 use rustc_hir::def::{self, DefKind, PartialRes};
 use rustc_middle::metadata::ModChild;
+use rustc_middle::metadata::Reexport;
 use rustc_middle::span_bug;
 use rustc_middle::ty;
 use rustc_session::lint::builtin::{
@@ -27,6 +28,7 @@ use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::hygiene::LocalExpnId;
 use rustc_span::symbol::{kw, Ident, Symbol};
 use rustc_span::Span;
+use smallvec::SmallVec;
 
 use std::cell::Cell;
 use std::{mem, ptr};
@@ -188,6 +190,17 @@ impl<'a> Import<'a> {
             | ImportKind::Glob { id, .. }
             | ImportKind::ExternCrate { id, .. } => Some(id),
             ImportKind::MacroUse | ImportKind::MacroExport => None,
+        }
+    }
+
+    fn simplify(&self, r: &Resolver<'_, '_>) -> Reexport {
+        let to_def_id = |id| r.local_def_id(id).to_def_id();
+        match self.kind {
+            ImportKind::Single { id, .. } => Reexport::Single(to_def_id(id)),
+            ImportKind::Glob { id, .. } => Reexport::Glob(to_def_id(id)),
+            ImportKind::ExternCrate { id, .. } => Reexport::ExternCrate(to_def_id(id)),
+            ImportKind::MacroUse => Reexport::MacroUse,
+            ImportKind::MacroExport => Reexport::MacroExport,
         }
     }
 }
@@ -565,7 +578,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         let mut diag = struct_span_err!(self.tcx.sess, span, E0432, "{}", &msg);
 
         if let Some((_, UnresolvedImportError { note: Some(note), .. })) = errors.iter().last() {
-            diag.note(note);
+            diag.note(note.clone());
         }
 
         for (import, err) in errors.into_iter().take(MAX_LABEL_COUNT) {
@@ -575,10 +588,10 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
 
             if let Some((suggestions, msg, applicability)) = err.suggestion {
                 if suggestions.is_empty() {
-                    diag.help(&msg);
+                    diag.help(msg);
                     continue;
                 }
-                diag.multipart_suggestion(&msg, suggestions, applicability);
+                diag.multipart_suggestion(msg, suggestions, applicability);
             }
 
             if let Some(candidates) = &err.candidates {
@@ -1050,7 +1063,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                     PUB_USE_OF_PRIVATE_EXTERN_CRATE,
                     import_id,
                     import.span,
-                    &msg,
+                    msg,
                 );
             } else {
                 let error_msg = if crate_private_reexport {
@@ -1071,7 +1084,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
 
                     struct_span_err!(self.tcx.sess, import.span, E0365, "{}", error_msg)
                         .span_label(import.span, label_msg)
-                        .note(&format!("consider declaring type or module `{}` with `pub`", ident))
+                        .note(format!("consider declaring type or module `{}` with `pub`", ident))
                         .emit();
                 } else {
                     let mut err =
@@ -1089,7 +1102,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                         _ => {
                             err.span_note(
                                 import.span,
-                                &format!(
+                                format!(
                                     "consider marking `{ident}` as `pub` in the imported module"
                                 ),
                             );
@@ -1187,7 +1200,7 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
                 UNUSED_IMPORTS,
                 id,
                 import.span,
-                &format!("the item `{}` is imported redundantly", ident),
+                format!("the item `{}` is imported redundantly", ident),
                 BuiltinLintDiagnostics::RedundantImport(redundant_spans, ident),
             );
         }
@@ -1248,24 +1261,25 @@ impl<'a, 'tcx> Resolver<'a, 'tcx> {
         *module.globs.borrow_mut() = Vec::new();
 
         if let Some(def_id) = module.opt_def_id() {
-            let mut reexports = Vec::new();
+            let mut children = Vec::new();
 
             module.for_each_child(self, |this, ident, _, binding| {
-                if let Some(res) = this.is_reexport(binding) {
-                    reexports.push(ModChild {
-                        ident,
-                        res,
-                        vis: binding.vis,
-                        span: binding.span,
-                        macro_rules: false,
-                    });
+                let res = binding.res().expect_non_local();
+                if res != def::Res::Err && !binding.is_ambiguity() {
+                    let mut reexport_chain = SmallVec::new();
+                    let mut next_binding = binding;
+                    while let NameBindingKind::Import { binding, import, .. } = next_binding.kind {
+                        reexport_chain.push(import.simplify(this));
+                        next_binding = binding;
+                    }
+
+                    children.push(ModChild { ident, res, vis: binding.vis, reexport_chain });
                 }
             });
 
-            if !reexports.is_empty() {
-                // Call to `expect_local` should be fine because current
-                // code is only called for local modules.
-                self.reexport_map.insert(def_id.expect_local(), reexports);
+            if !children.is_empty() {
+                // Should be fine because this code is only called for local modules.
+                self.module_children.insert(def_id.expect_local(), children);
             }
         }
     }

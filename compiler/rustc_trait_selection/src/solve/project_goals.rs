@@ -1,7 +1,6 @@
 use crate::traits::specialization_graph;
 
-use super::assembly;
-use super::trait_goals::structural_traits;
+use super::assembly::{self, structural_traits};
 use super::EvalCtxt;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
@@ -57,11 +56,11 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
         self.trait_def_id(tcx)
     }
 
-    fn consider_implied_clause(
+    fn probe_and_match_goal_against_assumption(
         ecx: &mut EvalCtxt<'_, 'tcx>,
         goal: Goal<'tcx, Self>,
         assumption: ty::Predicate<'tcx>,
-        requirements: impl IntoIterator<Item = Goal<'tcx, ty::Predicate<'tcx>>>,
+        then: impl FnOnce(&mut EvalCtxt<'_, 'tcx>) -> QueryResult<'tcx>,
     ) -> QueryResult<'tcx> {
         if let Some(poly_projection_pred) = assumption.to_opt_poly_projection_pred()
             && poly_projection_pred.projection_def_id() == goal.predicate.def_id()
@@ -74,49 +73,9 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
                     goal.predicate.projection_ty,
                     assumption_projection_pred.projection_ty,
                 )?;
-                ecx.eq(goal.param_env, goal.predicate.term, assumption_projection_pred.term)?;
-                ecx.add_goals(requirements);
-                ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
-            })
-        } else {
-            Err(NoSolution)
-        }
-    }
-
-    fn consider_object_bound_candidate(
-        ecx: &mut EvalCtxt<'_, 'tcx>,
-        goal: Goal<'tcx, Self>,
-        assumption: ty::Predicate<'tcx>,
-    ) -> QueryResult<'tcx> {
-        if let Some(poly_projection_pred) = assumption.to_opt_poly_projection_pred()
-            && poly_projection_pred.projection_def_id() == goal.predicate.def_id()
-        {
-            ecx.probe(|ecx| {
-                let tcx = ecx.tcx();
-
-                let assumption_projection_pred =
-                    ecx.instantiate_binder_with_infer(poly_projection_pred);
-                ecx.eq(
-                    goal.param_env,
-                    goal.predicate.projection_ty,
-                    assumption_projection_pred.projection_ty,
-                )?;
-
-                let ty::Dynamic(bounds, _, _) = *goal.predicate.self_ty().kind() else {
-                    bug!("expected object type in `consider_object_bound_candidate`");
-                };
-                ecx.add_goals(
-                    structural_traits::predicates_for_object_candidate(
-                        &ecx,
-                        goal.param_env,
-                        goal.predicate.projection_ty.trait_ref(tcx),
-                        bounds,
-                    )
-                    .into_iter()
-                    .map(|pred| goal.with(tcx, pred)),
-                );
-                ecx.eq(goal.param_env, goal.predicate.term, assumption_projection_pred.term)?;
-                ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
+                ecx.eq(goal.param_env, goal.predicate.term, assumption_projection_pred.term)
+                    .expect("expected goal term to be fully unconstrained");
+                then(ecx)
             })
         } else {
             Err(NoSolution)
@@ -199,7 +158,7 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
             let term: ty::EarlyBinder<ty::Term<'tcx>> = if is_const {
                 let identity_substs =
                     ty::InternalSubsts::identity_for_item(tcx, assoc_def.item.def_id);
-                let did = ty::WithOptConstParam::unknown(assoc_def.item.def_id);
+                let did = assoc_def.item.def_id;
                 let kind =
                     ty::ConstKind::Unevaluated(ty::UnevaluatedConst::new(did, identity_substs));
                 ty.map_bound(|ty| tcx.mk_const(kind, ty).into())
@@ -207,7 +166,8 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
                 ty.map_bound(|ty| ty.into())
             };
 
-            ecx.eq(goal.param_env, goal.predicate.term, term.subst(tcx, substs))?;
+            ecx.eq(goal.param_env, goal.predicate.term, term.subst(tcx, substs))
+                .expect("expected goal term to be fully unconstrained");
             ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
         })
     }
@@ -272,8 +232,9 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
                         .evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS);
                 }
             };
-        let output_is_sized_pred = tupled_inputs_and_output
-            .map_bound(|(_, output)| tcx.at(DUMMY_SP).mk_trait_ref(LangItem::Sized, [output]));
+        let output_is_sized_pred = tupled_inputs_and_output.map_bound(|(_, output)| {
+            ty::TraitRef::from_lang_item(tcx, LangItem::Sized, DUMMY_SP, [output])
+        });
 
         let pred = tupled_inputs_and_output
             .map_bound(|(inputs, output)| ty::ProjectionPredicate {
@@ -331,10 +292,12 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
 
                 ty::Alias(_, _) | ty::Param(_) | ty::Placeholder(..) => {
                     // FIXME(ptr_metadata): It would also be possible to return a `Ok(Ambig)` with no constraints.
-                    let sized_predicate = ty::Binder::dummy(tcx.at(DUMMY_SP).mk_trait_ref(
+                    let sized_predicate = ty::TraitRef::from_lang_item(
+                        tcx,
                         LangItem::Sized,
+                        DUMMY_SP,
                         [ty::GenericArg::from(goal.predicate.self_ty())],
-                    ));
+                    );
                     ecx.add_goal(goal.with(tcx, sized_predicate));
                     tcx.types.unit
                 }
@@ -376,7 +339,8 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
                 ),
             };
 
-            ecx.eq(goal.param_env, goal.predicate.term, metadata_ty.into())?;
+            ecx.eq(goal.param_env, goal.predicate.term, metadata_ty.into())
+                .expect("expected goal term to be fully unconstrained");
             ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
         })
     }
@@ -514,7 +478,8 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
         };
 
         ecx.probe(|ecx| {
-            ecx.eq(goal.param_env, goal.predicate.term, discriminant_ty.into())?;
+            ecx.eq(goal.param_env, goal.predicate.term, discriminant_ty.into())
+                .expect("expected goal term to be fully unconstrained");
             ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
         })
     }
@@ -524,6 +489,13 @@ impl<'tcx> assembly::GoalKind<'tcx> for ProjectionPredicate<'tcx> {
         goal: Goal<'tcx, Self>,
     ) -> QueryResult<'tcx> {
         bug!("`Destruct` does not have an associated type: {:?}", goal);
+    }
+
+    fn consider_builtin_transmute_candidate(
+        _ecx: &mut EvalCtxt<'_, 'tcx>,
+        goal: Goal<'tcx, Self>,
+    ) -> QueryResult<'tcx> {
+        bug!("`BikeshedIntrinsicFrom` does not have an associated type: {:?}", goal)
     }
 }
 

@@ -1,6 +1,5 @@
 use crate::array;
 use crate::cmp::{self, Ordering};
-use crate::marker::Destruct;
 use crate::num::NonZeroUsize;
 use crate::ops::{ChangeOutputType, ControlFlow, FromResidual, Residual, Try};
 
@@ -71,7 +70,6 @@ fn _assert_is_object_safe(_: &dyn Iterator<Item = ()>) {}
 #[doc(notable_trait)]
 #[rustc_diagnostic_item = "Iterator"]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
-#[const_trait]
 pub trait Iterator {
     /// The type of the elements being iterated over.
     #[rustc_diagnostic_item = "IteratorItem"]
@@ -340,10 +338,8 @@ pub trait Iterator {
     /// ```
     #[inline]
     #[unstable(feature = "iter_advance_by", reason = "recently added", issue = "77404")]
-    fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize>
-    where
-        Self::Item: ~const Destruct,
-    {
+    #[rustc_do_not_const_check]
+    fn advance_by(&mut self, n: usize) -> Result<(), NonZeroUsize> {
         for i in 0..n {
             if self.next().is_none() {
                 // SAFETY: `i` is always less than `n`.
@@ -394,10 +390,8 @@ pub trait Iterator {
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    fn nth(&mut self, n: usize) -> Option<Self::Item>
-    where
-        Self::Item: ~const Destruct,
-    {
+    #[rustc_do_not_const_check]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
         self.advance_by(n).ok()?;
         self.next()
     }
@@ -769,7 +763,6 @@ pub trait Iterator {
     /// more idiomatic to use [`for`] than `map()`.
     ///
     /// [`for`]: ../../book/ch03-05-control-flow.html#looping-through-a-collection-with-for
-    /// [`FnMut`]: crate::ops::FnMut
     ///
     /// # Examples
     ///

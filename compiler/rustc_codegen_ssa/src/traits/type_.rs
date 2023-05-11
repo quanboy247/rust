@@ -100,11 +100,22 @@ pub trait DerivedTypeMethods<'tcx>: BaseTypeMethods<'tcx> + MiscMethods<'tcx> {
 impl<'tcx, T> DerivedTypeMethods<'tcx> for T where Self: BaseTypeMethods<'tcx> + MiscMethods<'tcx> {}
 
 pub trait LayoutTypeMethods<'tcx>: Backend<'tcx> {
+    /// The backend type used for a rust type when it's in memory,
+    /// such as when it's stack-allocated or when it's being loaded or stored.
     fn backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type;
     fn cast_backend_type(&self, ty: &CastTarget) -> Self::Type;
     fn fn_decl_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Self::Type;
     fn fn_ptr_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Self::Type;
     fn reg_backend_type(&self, ty: &Reg) -> Self::Type;
+    /// The backend type used for a rust type when it's in an SSA register.
+    ///
+    /// For nearly all types this is the same as the [`Self::backend_type`], however
+    /// `bool` (and other `0`-or-`1` values) are kept as [`BaseTypeMethods::type_i1`]
+    /// in registers but as [`BaseTypeMethods::type_i8`] in memory.
+    ///
+    /// Converting values between the two different backend types is done using
+    /// [`from_immediate`](super::BuilderMethods::from_immediate) and
+    /// [`to_immediate_scalar`](super::BuilderMethods::to_immediate_scalar).
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> Self::Type;
     fn is_backend_immediate(&self, layout: TyAndLayout<'tcx>) -> bool;
     fn is_backend_scalar_pair(&self, layout: TyAndLayout<'tcx>) -> bool;
@@ -117,12 +128,16 @@ pub trait LayoutTypeMethods<'tcx>: Backend<'tcx> {
     ) -> Self::Type;
 }
 
-// For backends that support CFI using type membership (i.e., testing whether a given  pointer is
+// For backends that support CFI using type membership (i.e., testing whether a given pointer is
 // associated with a type identifier).
 pub trait TypeMembershipMethods<'tcx>: Backend<'tcx> {
-    fn set_type_metadata(&self, function: Self::Function, typeid: String);
-    fn typeid_metadata(&self, typeid: String) -> Self::Value;
-    fn set_kcfi_type_metadata(&self, function: Self::Function, typeid: u32);
+    fn add_type_metadata(&self, _function: Self::Function, _typeid: String) {}
+    fn set_type_metadata(&self, _function: Self::Function, _typeid: String) {}
+    fn typeid_metadata(&self, _typeid: String) -> Option<Self::Value> {
+        None
+    }
+    fn add_kcfi_type_metadata(&self, _function: Self::Function, _typeid: u32) {}
+    fn set_kcfi_type_metadata(&self, _function: Self::Function, _typeid: u32) {}
 }
 
 pub trait ArgAbiMethods<'tcx>: HasCodegen<'tcx> {

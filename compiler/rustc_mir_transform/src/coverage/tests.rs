@@ -34,7 +34,7 @@ use coverage_test_macros::let_bcb;
 use itertools::Itertools;
 use rustc_data_structures::graph::WithNumNodes;
 use rustc_data_structures::graph::WithSuccessors;
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::mir::*;
 use rustc_middle::ty;
@@ -140,7 +140,7 @@ impl<'tcx> MockBlocks<'tcx> {
                 args: vec![],
                 destination: self.dummy_place.clone(),
                 target: Some(TEMP_BLOCK),
-                cleanup: None,
+                unwind: UnwindAction::Continue,
                 from_hir_call: false,
                 fn_span: DUMMY_SP,
             },

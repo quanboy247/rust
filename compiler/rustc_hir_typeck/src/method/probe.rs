@@ -793,6 +793,14 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         // a `&self` method will wind up with an argument type like `&dyn Trait`.
         let trait_ref = principal.with_self_ty(self.tcx, self_ty);
         self.elaborate_bounds(iter::once(trait_ref), |this, new_trait_ref, item| {
+            if new_trait_ref.has_non_region_late_bound() {
+                this.tcx.sess.delay_span_bug(
+                    this.span,
+                    "tried to select method from HRTB with non-lifetime bound vars",
+                );
+                return;
+            }
+
             let new_trait_ref = this.erase_late_bound_regions(new_trait_ref);
 
             let (xform_self_ty, xform_ret_ty) =
@@ -843,17 +851,14 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         });
 
         self.elaborate_bounds(bounds, |this, poly_trait_ref, item| {
-            let trait_ref = this.erase_late_bound_regions(poly_trait_ref);
+            let trait_ref = this.instantiate_binder_with_fresh_vars(
+                this.span,
+                infer::LateBoundRegionConversionTime::FnCall,
+                poly_trait_ref,
+            );
 
             let (xform_self_ty, xform_ret_ty) =
                 this.xform_self_ty(item, trait_ref.self_ty(), trait_ref.substs);
-
-            // Because this trait derives from a where-clause, it
-            // should not contain any inference variables or other
-            // artifacts. This means it is safe to put into the
-            // `WhereClauseCandidate` and (eventually) into the
-            // `WhereClausePick`.
-            assert!(!trait_ref.substs.needs_infer());
 
             this.push_candidate(
                 Candidate {
@@ -949,7 +954,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     ) {
         debug!("assemble_extension_candidates_for_trait(trait_def_id={:?})", trait_def_id);
         let trait_substs = self.fresh_item_substs(trait_def_id);
-        let trait_ref = self.tcx.mk_trait_ref(trait_def_id, trait_substs);
+        let trait_ref = ty::TraitRef::new(self.tcx, trait_def_id, trait_substs);
 
         if self.tcx.is_trait_alias(trait_def_id) {
             // For trait aliases, recursively assume all explicitly named traits are relevant
@@ -964,7 +969,11 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                             bound_trait_ref.def_id(),
                         ));
                     } else {
-                        let new_trait_ref = self.erase_late_bound_regions(bound_trait_ref);
+                        let new_trait_ref = self.instantiate_binder_with_fresh_vars(
+                            self.span,
+                            infer::LateBoundRegionConversionTime::FnCall,
+                            bound_trait_ref,
+                        );
 
                         let (xform_self_ty, xform_ret_ty) =
                             self.xform_self_ty(item, new_trait_ref.self_ty(), new_trait_ref.substs);
@@ -1387,7 +1396,7 @@ impl<'tcx> Pick<'tcx> {
                         // However `self.span` only
                         // highlights the method name, so we can't use it. Also consider reusing
                         // the code from `report_method_error()`.
-                        lint.help(&format!(
+                        lint.help(format!(
                             "call with fully qualified syntax `{}(...)` to keep using the current \
                              method",
                             tcx.def_path_str(self.item.def_id),
@@ -1411,7 +1420,7 @@ impl<'tcx> Pick<'tcx> {
                 }
                 if tcx.sess.is_nightly_build() {
                     for (candidate, feature) in &self.unstable_candidates {
-                        lint.help(&format!(
+                        lint.help(format!(
                             "add `#![feature({})]` to the crate attributes to enable `{}`",
                             feature,
                             tcx.def_path_str(candidate.item.def_id),
@@ -1522,23 +1531,18 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
 
                     // Convert the bounds into obligations.
                     let impl_obligations = traits::predicates_for_generics(
-                        |_idx, span| {
-                            let misc = traits::ObligationCause::misc(span, self.body_id);
-                            let parent_trait_pred = ty::Binder::dummy(ty::TraitPredicate {
-                                trait_ref: ty::TraitRef::from_method(self.tcx, impl_def_id, substs),
-                                constness: ty::BoundConstness::NotConst,
-                                polarity: ty::ImplPolarity::Positive,
-                            });
-                            misc.derived_cause(parent_trait_pred, |derived| {
-                                traits::ImplDerivedObligation(Box::new(
-                                    traits::ImplDerivedObligationCause {
-                                        derived,
-                                        impl_or_alias_def_id: impl_def_id,
-                                        impl_def_predicate_index: None,
-                                        span,
-                                    },
-                                ))
-                            })
+                        |idx, span| {
+                            let code = if span.is_dummy() {
+                                traits::ExprItemObligation(impl_def_id, self.scope_expr_id, idx)
+                            } else {
+                                traits::ExprBindingObligation(
+                                    impl_def_id,
+                                    span,
+                                    self.scope_expr_id,
+                                    idx,
+                                )
+                            };
+                            ObligationCause::new(self.span, self.body_id, code)
                         },
                         self.param_env,
                         impl_bounds,
@@ -1555,8 +1559,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                         if !self.predicate_may_hold(&o) {
                             result = ProbeResult::NoMatch;
                             let parent_o = o.clone();
-                            let implied_obligations =
-                                traits::elaborate_obligations(self.tcx, vec![o]);
+                            let implied_obligations = traits::elaborate(self.tcx, vec![o]);
                             for o in implied_obligations {
                                 let parent = if o == parent_o {
                                     None
@@ -1756,7 +1759,6 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
     fn probe_for_similar_candidate(&mut self) -> Result<Option<ty::AssocItem>, MethodError<'tcx>> {
         debug!("probing for method names similar to {:?}", self.method_name);
 
-        let steps = self.steps.clone();
         self.probe(|_| {
             let mut pcx = ProbeContext::new(
                 self.fcx,
@@ -1764,8 +1766,8 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                 self.mode,
                 self.method_name,
                 self.return_type,
-                &self.orig_steps_var_values,
-                steps,
+                self.orig_steps_var_values,
+                self.steps,
                 self.scope_expr_id,
             );
             pcx.allow_similar_names = true;
@@ -2030,7 +2032,7 @@ impl<'tcx> Candidate<'tcx> {
                     // means they are safe to put into the
                     // `WhereClausePick`.
                     assert!(
-                        !trait_ref.skip_binder().substs.needs_infer()
+                        !trait_ref.skip_binder().substs.has_infer()
                             && !trait_ref.skip_binder().substs.has_placeholders()
                     );
 

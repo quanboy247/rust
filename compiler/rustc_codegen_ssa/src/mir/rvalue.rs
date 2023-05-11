@@ -10,8 +10,9 @@ use crate::MemFlags;
 use rustc_middle::mir;
 use rustc_middle::mir::Operand;
 use rustc_middle::ty::cast::{CastTy, IntTy};
-use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf};
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, adjustment::PointerCast, Instance, Ty, TyCtxt};
+use rustc_session::config::OptLevel;
 use rustc_span::source_map::{Span, DUMMY_SP};
 use rustc_target::abi::{self, FIRST_VARIANT};
 
@@ -158,39 +159,204 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         debug_assert!(src.layout.is_sized());
         debug_assert!(dst.layout.is_sized());
 
-        if src.layout.size != dst.layout.size
-            || src.layout.abi == abi::Abi::Uninhabited
-            || dst.layout.abi == abi::Abi::Uninhabited
-        {
-            // In all of these cases it's UB to run this transmute, but that's
-            // known statically so might as well trap for it, rather than just
-            // making it unreachable.
-            bx.abort();
-            return;
-        }
-
-        let size_in_bytes = src.layout.size.bytes();
-        if size_in_bytes == 0 {
-            // Nothing to write
+        if let Some(val) = self.codegen_transmute_operand(bx, src, dst.layout) {
+            val.store(bx, dst);
             return;
         }
 
         match src.val {
-            OperandValue::Ref(src_llval, meta, src_align) => {
-                debug_assert_eq!(meta, None);
-                // For a place-to-place transmute, call `memcpy` directly so that
-                // both arguments get the best-available alignment information.
-                let bytes = bx.cx().const_usize(size_in_bytes);
-                let flags = MemFlags::empty();
-                bx.memcpy(dst.llval, dst.align, src_llval, src_align, bytes, flags);
+            OperandValue::Ref(..) => {
+                span_bug!(
+                    self.mir.span,
+                    "Operand path should have handled transmute \
+                    from `Ref` {src:?} to place {dst:?}"
+                );
             }
-            OperandValue::Immediate(_) | OperandValue::Pair(_, _) => {
+            OperandValue::Immediate(..) | OperandValue::Pair(..) => {
                 // When we have immediate(s), the alignment of the source is irrelevant,
                 // so we can store them using the destination's alignment.
                 let llty = bx.backend_type(src.layout);
                 let cast_ptr = bx.pointercast(dst.llval, bx.type_ptr_to(llty));
                 src.val.store(bx, PlaceRef::new_sized_aligned(cast_ptr, src.layout, dst.align));
             }
+        }
+    }
+
+    /// Attempts to transmute an `OperandValue` to another `OperandValue`.
+    ///
+    /// Returns `None` for cases that can't work in that framework, such as for
+    /// `Immediate`->`Ref` that needs an `alloc` to get the location.
+    fn codegen_transmute_operand(
+        &mut self,
+        bx: &mut Bx,
+        operand: OperandRef<'tcx, Bx::Value>,
+        cast: TyAndLayout<'tcx>,
+    ) -> Option<OperandValue<Bx::Value>> {
+        // Check for transmutes that are always UB.
+        if operand.layout.size != cast.size
+            || operand.layout.abi.is_uninhabited()
+            || cast.abi.is_uninhabited()
+        {
+            if !operand.layout.abi.is_uninhabited() {
+                // Since this is known statically and the input could have existed
+                // without already having hit UB, might as well trap for it.
+                bx.abort();
+            }
+
+            // Because this transmute is UB, return something easy to generate,
+            // since it's fine that later uses of the value are probably UB.
+            return Some(OperandValue::poison(bx, cast));
+        }
+
+        let operand_kind = self.value_kind(operand.layout);
+        let cast_kind = self.value_kind(cast);
+
+        match operand.val {
+            OperandValue::Ref(ptr, meta, align) => {
+                debug_assert_eq!(meta, None);
+                debug_assert!(matches!(operand_kind, OperandValueKind::Ref));
+                let cast_bty = bx.backend_type(cast);
+                let cast_ptr = bx.pointercast(ptr, bx.type_ptr_to(cast_bty));
+                let fake_place = PlaceRef::new_sized_aligned(cast_ptr, cast, align);
+                Some(bx.load_operand(fake_place).val)
+            }
+            OperandValue::Immediate(imm) => {
+                let OperandValueKind::Immediate(in_scalar) = operand_kind else {
+                    bug!("Found {operand_kind:?} for operand {operand:?}");
+                };
+                if let OperandValueKind::Immediate(out_scalar) = cast_kind {
+                    match (in_scalar, out_scalar) {
+                        (ScalarOrZst::Zst, ScalarOrZst::Zst) => {
+                            Some(OperandRef::new_zst(bx, cast).val)
+                        }
+                        (ScalarOrZst::Scalar(in_scalar), ScalarOrZst::Scalar(out_scalar))
+                            if in_scalar.size(self.cx) == out_scalar.size(self.cx) =>
+                        {
+                            let operand_bty = bx.backend_type(operand.layout);
+                            let cast_bty = bx.backend_type(cast);
+                            Some(OperandValue::Immediate(self.transmute_immediate(
+                                bx,
+                                imm,
+                                in_scalar,
+                                operand_bty,
+                                out_scalar,
+                                cast_bty,
+                            )))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            OperandValue::Pair(imm_a, imm_b) => {
+                let OperandValueKind::Pair(in_a, in_b) = operand_kind else {
+                    bug!("Found {operand_kind:?} for operand {operand:?}");
+                };
+                if let OperandValueKind::Pair(out_a, out_b) = cast_kind
+                    && in_a.size(self.cx) == out_a.size(self.cx)
+                    && in_b.size(self.cx) == out_b.size(self.cx)
+                {
+                    let in_a_ibty = bx.scalar_pair_element_backend_type(operand.layout, 0, false);
+                    let in_b_ibty = bx.scalar_pair_element_backend_type(operand.layout, 1, false);
+                    let out_a_ibty = bx.scalar_pair_element_backend_type(cast, 0, false);
+                    let out_b_ibty = bx.scalar_pair_element_backend_type(cast, 1, false);
+                    Some(OperandValue::Pair(
+                        self.transmute_immediate(bx, imm_a, in_a, in_a_ibty, out_a, out_a_ibty),
+                        self.transmute_immediate(bx, imm_b, in_b, in_b_ibty, out_b, out_b_ibty),
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Transmutes one of the immediates from an [`OperandValue::Immediate`]
+    /// or an [`OperandValue::Pair`] to an immediate of the target type.
+    ///
+    /// `to_backend_ty` must be the *non*-immediate backend type (so it will be
+    /// `i8`, not `i1`, for `bool`-like types.)
+    fn transmute_immediate(
+        &self,
+        bx: &mut Bx,
+        mut imm: Bx::Value,
+        from_scalar: abi::Scalar,
+        from_backend_ty: Bx::Type,
+        to_scalar: abi::Scalar,
+        to_backend_ty: Bx::Type,
+    ) -> Bx::Value {
+        debug_assert_eq!(from_scalar.size(self.cx), to_scalar.size(self.cx));
+
+        use abi::Primitive::*;
+        imm = bx.from_immediate(imm);
+
+        // When scalars are passed by value, there's no metadata recording their
+        // valid ranges. For example, `char`s are passed as just `i32`, with no
+        // way for LLVM to know that they're 0x10FFFF at most. Thus we assume
+        // the range of the input value too, not just the output range.
+        self.assume_scalar_range(bx, imm, from_scalar, from_backend_ty);
+
+        imm = match (from_scalar.primitive(), to_scalar.primitive()) {
+            (Int(..) | F32 | F64, Int(..) | F32 | F64) => bx.bitcast(imm, to_backend_ty),
+            (Pointer(..), Pointer(..)) => bx.pointercast(imm, to_backend_ty),
+            (Int(..), Pointer(..)) => bx.inttoptr(imm, to_backend_ty),
+            (Pointer(..), Int(..)) => bx.ptrtoint(imm, to_backend_ty),
+            (F32 | F64, Pointer(..)) => {
+                let int_imm = bx.bitcast(imm, bx.cx().type_isize());
+                bx.inttoptr(int_imm, to_backend_ty)
+            }
+            (Pointer(..), F32 | F64) => {
+                let int_imm = bx.ptrtoint(imm, bx.cx().type_isize());
+                bx.bitcast(int_imm, to_backend_ty)
+            }
+        };
+        self.assume_scalar_range(bx, imm, to_scalar, to_backend_ty);
+        imm = bx.to_immediate_scalar(imm, to_scalar);
+        imm
+    }
+
+    fn assume_scalar_range(
+        &self,
+        bx: &mut Bx,
+        imm: Bx::Value,
+        scalar: abi::Scalar,
+        backend_ty: Bx::Type,
+    ) {
+        if matches!(self.cx.sess().opts.optimize, OptLevel::No | OptLevel::Less)
+            // For now, the critical niches are all over `Int`eger values.
+            // Should floating-point values or pointers ever get more complex
+            // niches, then this code will probably want to handle them too.
+            || !matches!(scalar.primitive(), abi::Primitive::Int(..))
+            || scalar.is_always_valid(self.cx)
+        {
+            return;
+        }
+
+        let abi::WrappingRange { start, end } = scalar.valid_range(self.cx);
+
+        if start <= end {
+            if start > 0 {
+                let low = bx.const_uint_big(backend_ty, start);
+                let cmp = bx.icmp(IntPredicate::IntUGE, imm, low);
+                bx.assume(cmp);
+            }
+
+            let type_max = scalar.size(self.cx).unsigned_int_max();
+            if end < type_max {
+                let high = bx.const_uint_big(backend_ty, end);
+                let cmp = bx.icmp(IntPredicate::IntULE, imm, high);
+                bx.assume(cmp);
+            }
+        } else {
+            let low = bx.const_uint_big(backend_ty, start);
+            let cmp_low = bx.icmp(IntPredicate::IntUGE, imm, low);
+
+            let high = bx.const_uint_big(backend_ty, end);
+            let cmp_high = bx.icmp(IntPredicate::IntULE, imm, high);
+
+            let or = bx.or(cmp_low, cmp_high);
+            bx.assume(or);
         }
     }
 
@@ -396,7 +562,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         OperandValue::Immediate(newval)
                     }
                     mir::CastKind::Transmute => {
-                        bug!("Transmute operand {:?} in `codegen_rvalue_operand`", operand);
+                        self.codegen_transmute_operand(bx, operand, cast).unwrap_or_else(|| {
+                            bug!("Unsupported transmute-as-operand of {operand:?} to {cast:?}");
+                        })
                     }
                 };
                 OperandRef { val, layout: cast }
@@ -498,13 +666,16 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
             }
 
-            mir::Rvalue::NullaryOp(null_op, ty) => {
+            mir::Rvalue::NullaryOp(ref null_op, ty) => {
                 let ty = self.monomorphize(ty);
                 assert!(bx.cx().type_is_sized(ty));
                 let layout = bx.cx().layout_of(ty);
                 let val = match null_op {
                     mir::NullOp::SizeOf => layout.size.bytes(),
                     mir::NullOp::AlignOf => layout.align.abi.bytes(),
+                    mir::NullOp::OffsetOf(fields) => {
+                        layout.offset_of_subfield(bx.cx(), fields.iter().map(|f| f.index())).bytes()
+                    }
                 };
                 let val = bx.cx().const_usize(val);
                 let tcx = self.cx.tcx();
@@ -526,7 +697,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     let fn_ptr = bx.get_fn_addr(instance);
                     let fn_abi = bx.fn_abi_of_instance(instance, ty::List::empty());
                     let fn_ty = bx.fn_decl_backend_type(&fn_abi);
-                    bx.call(fn_ty, Some(fn_abi), fn_ptr, &[], None)
+                    let fn_attrs = if bx.tcx().def_kind(instance.def_id()).has_codegen_attrs() {
+                        Some(bx.tcx().codegen_fn_attrs(instance.def_id()))
+                    } else {
+                        None
+                    };
+                    bx.call(fn_ty, fn_attrs, Some(fn_abi), fn_ptr, &[], None)
                 } else {
                     bx.get_static(def_id)
                 };
@@ -648,8 +824,15 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     .builtin_deref(true)
                     .unwrap_or_else(|| bug!("deref of non-pointer {:?}", input_ty))
                     .ty;
-                let llty = bx.cx().backend_type(bx.cx().layout_of(pointee_type));
-                bx.inbounds_gep(llty, lhs, &[rhs])
+                let pointee_layout = bx.cx().layout_of(pointee_type);
+                if pointee_layout.is_zst() {
+                    // `Offset` works in terms of the size of pointee,
+                    // so offsetting a pointer to ZST is a noop.
+                    lhs
+                } else {
+                    let llty = bx.cx().backend_type(pointee_layout);
+                    bx.inbounds_gep(llty, lhs, &[rhs])
+                }
             }
             mir::BinOp::Shl => common::build_unchecked_lshift(bx, lhs, rhs),
             mir::BinOp::Shr => common::build_unchecked_rshift(bx, input_ty, lhs, rhs),
@@ -739,10 +922,31 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     pub fn rvalue_creates_operand(&self, rvalue: &mir::Rvalue<'tcx>, span: Span) -> bool {
         match *rvalue {
-            mir::Rvalue::Cast(mir::CastKind::Transmute, ..) =>
-                // FIXME: Now that transmute is an Rvalue, it would be nice if
-                // it could create `Immediate`s for scalars, where possible.
-                false,
+            mir::Rvalue::Cast(mir::CastKind::Transmute, ref operand, cast_ty) => {
+                let operand_ty = operand.ty(self.mir, self.cx.tcx());
+                let cast_layout = self.cx.layout_of(self.monomorphize(cast_ty));
+                let operand_layout = self.cx.layout_of(self.monomorphize(operand_ty));
+
+                match (self.value_kind(operand_layout), self.value_kind(cast_layout)) {
+                    // Can always load from a pointer as needed
+                    (OperandValueKind::Ref, _) => true,
+
+                    // Need to generate an `alloc` to get a pointer from an immediate
+                    (OperandValueKind::Immediate(..) | OperandValueKind::Pair(..), OperandValueKind::Ref) => false,
+
+                    // When we have scalar immediates, we can only convert things
+                    // where the sizes match, to avoid endianness questions.
+                    (OperandValueKind::Immediate(a), OperandValueKind::Immediate(b)) =>
+                        a.size(self.cx) == b.size(self.cx),
+                    (OperandValueKind::Pair(a0, a1), OperandValueKind::Pair(b0, b1)) =>
+                        a0.size(self.cx) == b0.size(self.cx) && a1.size(self.cx) == b1.size(self.cx),
+
+                    // Send mixings between scalars and pairs through the memory route
+                    // FIXME: Maybe this could use insertvalue/extractvalue instead?
+                    (OperandValueKind::Immediate(..), OperandValueKind::Pair(..)) |
+                    (OperandValueKind::Pair(..), OperandValueKind::Immediate(..)) => false,
+                }
+            }
             mir::Rvalue::Ref(..) |
             mir::Rvalue::CopyForDeref(..) |
             mir::Rvalue::AddressOf(..) |
@@ -766,5 +970,53 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         }
 
         // (*) this is only true if the type is suitable
+    }
+
+    /// Gets which variant of [`OperandValue`] is expected for a particular type.
+    fn value_kind(&self, layout: TyAndLayout<'tcx>) -> OperandValueKind {
+        if self.cx.is_backend_immediate(layout) {
+            debug_assert!(!self.cx.is_backend_scalar_pair(layout));
+            OperandValueKind::Immediate(match layout.abi {
+                abi::Abi::Scalar(s) => ScalarOrZst::Scalar(s),
+                abi::Abi::Vector { element, .. } => ScalarOrZst::Scalar(element),
+                _ if layout.is_zst() => ScalarOrZst::Zst,
+                x => span_bug!(self.mir.span, "Couldn't translate {x:?} as backend immediate"),
+            })
+        } else if self.cx.is_backend_scalar_pair(layout) {
+            let abi::Abi::ScalarPair(s1, s2) = layout.abi else {
+                span_bug!(
+                    self.mir.span,
+                    "Couldn't translate {:?} as backend scalar pair",
+                    layout.abi,
+                );
+            };
+            OperandValueKind::Pair(s1, s2)
+        } else {
+            OperandValueKind::Ref
+        }
+    }
+}
+
+/// The variants of this match [`OperandValue`], giving details about the
+/// backend values that will be held in that other type.
+#[derive(Debug, Copy, Clone)]
+enum OperandValueKind {
+    Ref,
+    Immediate(ScalarOrZst),
+    Pair(abi::Scalar, abi::Scalar),
+}
+
+#[derive(Debug, Copy, Clone)]
+enum ScalarOrZst {
+    Zst,
+    Scalar(abi::Scalar),
+}
+
+impl ScalarOrZst {
+    pub fn size(self, cx: &impl abi::HasDataLayout) -> abi::Size {
+        match self {
+            ScalarOrZst::Zst => abi::Size::ZERO,
+            ScalarOrZst::Scalar(s) => s.size(cx),
+        }
     }
 }

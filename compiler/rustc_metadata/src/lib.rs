@@ -22,15 +22,13 @@ extern crate proc_macro;
 extern crate rustc_macros;
 #[macro_use]
 extern crate rustc_middle;
-#[macro_use]
-extern crate rustc_data_structures;
 
 #[macro_use]
 extern crate tracing;
 
 pub use rmeta::{provide, provide_extern};
 use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
-use rustc_macros::fluent_messages;
+use rustc_fluent_macro::fluent_messages;
 
 mod dependency_format;
 mod foreign_modules;

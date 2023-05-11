@@ -73,6 +73,8 @@ impl<'tcx> InferCtxt<'tcx> {
         R: ObligationEmittingRelation<'tcx>,
     {
         let a_is_expected = relation.a_is_expected();
+        debug_assert!(!a.has_escaping_bound_vars());
+        debug_assert!(!b.has_escaping_bound_vars());
 
         match (a.kind(), b.kind()) {
             // Relate integral variables to other types
@@ -125,7 +127,8 @@ impl<'tcx> InferCtxt<'tcx> {
                 bug!()
             }
 
-            (_, ty::Alias(AliasKind::Projection, _)) | (ty::Alias(AliasKind::Projection, _), _)
+            (_, ty::Alias(AliasKind::Projection | AliasKind::Inherent, _))
+            | (ty::Alias(AliasKind::Projection | AliasKind::Inherent, _), _)
                 if self.tcx.trait_solver_next() =>
             {
                 relation.register_type_relate_obligation(a, b);
@@ -163,6 +166,8 @@ impl<'tcx> InferCtxt<'tcx> {
         R: ObligationEmittingRelation<'tcx>,
     {
         debug!("{}.consts({:?}, {:?})", relation.tag(), a, b);
+        debug_assert!(!a.has_escaping_bound_vars());
+        debug_assert!(!b.has_escaping_bound_vars());
         if a == b {
             return Ok(a);
         }
@@ -192,7 +197,7 @@ impl<'tcx> InferCtxt<'tcx> {
             self.tcx.check_tys_might_be_eq(canonical).map_err(|_| {
                 self.tcx.sess.delay_span_bug(
                     DUMMY_SP,
-                    &format!("cannot relate consts of different types (a={:?}, b={:?})", a, b,),
+                    format!("cannot relate consts of different types (a={:?}, b={:?})", a, b,),
                 )
             })
         });
@@ -238,21 +243,11 @@ impl<'tcx> InferCtxt<'tcx> {
             (_, ty::ConstKind::Infer(InferConst::Var(vid))) => {
                 return self.unify_const_variable(vid, a);
             }
-            (ty::ConstKind::Unevaluated(..), _) if self.tcx.lazy_normalization() => {
-                // FIXME(#59490): Need to remove the leak check to accommodate
-                // escaping bound variables here.
-                if !a.has_escaping_bound_vars() && !b.has_escaping_bound_vars() {
-                    relation.register_const_equate_obligation(a, b);
-                }
+            (ty::ConstKind::Unevaluated(..), _) | (_, ty::ConstKind::Unevaluated(..))
+                if self.tcx.lazy_normalization() =>
+            {
+                relation.register_const_equate_obligation(a, b);
                 return Ok(b);
-            }
-            (_, ty::ConstKind::Unevaluated(..)) if self.tcx.lazy_normalization() => {
-                // FIXME(#59490): Need to remove the leak check to accommodate
-                // escaping bound variables here.
-                if !a.has_escaping_bound_vars() && !b.has_escaping_bound_vars() {
-                    relation.register_const_equate_obligation(a, b);
-                }
-                return Ok(a);
             }
             _ => {}
         }
@@ -832,7 +827,7 @@ pub trait ObligationEmittingRelation<'tcx>: TypeRelation<'tcx> {
 
     /// Register predicates that must hold in order for this relation to hold. Uses
     /// a default obligation cause, [`ObligationEmittingRelation::register_obligations`] should
-    /// be used if control over the obligaton causes is required.
+    /// be used if control over the obligation causes is required.
     fn register_predicates(&mut self, obligations: impl IntoIterator<Item: ToPredicate<'tcx>>);
 
     /// Register an obligation that both constants must be equal to each other.

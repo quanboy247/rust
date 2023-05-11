@@ -7,14 +7,15 @@
 #![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(drain_filter)]
-#![feature(is_terminal)]
-#![feature(let_chains)]
-#![feature(test)]
-#![feature(never_type)]
-#![feature(lazy_cell)]
-#![feature(type_ascription)]
+#![feature(impl_trait_in_assoc_type)]
 #![feature(iter_intersperse)]
+#![feature(lazy_cell)]
+#![feature(let_chains)]
+#![feature(never_type)]
+#![feature(round_char_boundary)]
+#![feature(test)]
 #![feature(type_alias_impl_trait)]
+#![feature(type_ascription)]
 #![recursion_limit = "256"]
 #![warn(rustc::internal)]
 #![allow(clippy::collapsible_if, clippy::collapsible_else_if)]
@@ -33,6 +34,7 @@ extern crate tracing;
 // Dependencies listed in Cargo.toml do not need `extern crate`.
 
 extern crate pulldown_cmark;
+extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;
 extern crate rustc_attr;
@@ -69,7 +71,6 @@ extern crate test;
 #[cfg(feature = "jemalloc")]
 extern crate jemalloc_sys;
 
-use std::default::Default;
 use std::env::{self, VarError};
 use std::io::{self, IsTerminal};
 use std::process;
@@ -155,15 +156,19 @@ pub fn main() {
         }
     }
 
-    rustc_driver::install_ice_hook();
+    rustc_driver::install_ice_hook(
+        "https://github.com/rust-lang/rust/issues/new\
+    ?labels=C-bug%2C+I-ICE%2C+T-rustdoc&template=ice.md",
+        |_| (),
+    );
 
-    // When using CI artifacts (with `download_stage1 = true`), tracing is unconditionally built
+    // When using CI artifacts with `download-rustc`, tracing is unconditionally built
     // with `--features=static_max_level_info`, which disables almost all rustdoc logging. To avoid
     // this, compile our own version of `tracing` that logs all levels.
     // NOTE: this compiles both versions of tracing unconditionally, because
     // - The compile time hit is not that bad, especially compared to rustdoc's incremental times, and
-    // - Otherwise, there's no warning that logging is being ignored when `download_stage1 = true`.
-    // NOTE: The reason this doesn't show double logging when `download_stage1 = false` and
+    // - Otherwise, there's no warning that logging is being ignored when `download-rustc` is enabled
+    // NOTE: The reason this doesn't show double logging when `download-rustc = false` and
     // `debug_logging = true` is because all rustc logging goes to its version of tracing (the one
     // in the sysroot), and all of rustdoc's logging goes to its version (the one in Cargo.toml).
     init_logging();
@@ -171,7 +176,11 @@ pub fn main() {
 
     let exit_code = rustc_driver::catch_with_exit_code(|| match get_args() {
         Some(args) => main_args(&args),
-        _ => Err(ErrorGuaranteed::unchecked_claim_error_was_emitted()),
+        _ =>
+        {
+            #[allow(deprecated)]
+            Err(ErrorGuaranteed::unchecked_claim_error_was_emitted())
+        }
     });
     process::exit(exit_code);
 }
@@ -203,7 +212,7 @@ fn init_logging() {
         .with_verbose_exit(true)
         .with_verbose_entry(true)
         .with_indent_amount(2);
-    #[cfg(parallel_compiler)]
+    #[cfg(all(parallel_compiler, debug_assertions))]
     let layer = layer.with_thread_ids(true).with_thread_names(true);
 
     use tracing_subscriber::layer::SubscriberExt;
@@ -284,7 +293,7 @@ fn opts() -> Vec<RustcOptGroup> {
         stable("test-args", |o| {
             o.optmulti("", "test-args", "arguments to pass to the test runner", "ARGS")
         }),
-        unstable("test-run-directory", |o| {
+        stable("test-run-directory", |o| {
             o.optopt(
                 "",
                 "test-run-directory",
@@ -676,7 +685,7 @@ fn wrap_return(diag: &rustc_errors::Handler, res: Result<(), String>) -> MainRes
     match res {
         Ok(()) => diag.has_errors().map_or(Ok(()), Err),
         Err(err) => {
-            let reported = diag.struct_err(&err).emit();
+            let reported = diag.struct_err(err).emit();
             Err(reported)
         }
     }
@@ -692,10 +701,10 @@ fn run_renderer<'tcx, T: formats::FormatRenderer<'tcx>>(
         Ok(_) => tcx.sess.has_errors().map_or(Ok(()), Err),
         Err(e) => {
             let mut msg =
-                tcx.sess.struct_err(&format!("couldn't generate documentation: {}", e.error));
+                tcx.sess.struct_err(format!("couldn't generate documentation: {}", e.error));
             let file = e.file.display().to_string();
             if !file.is_empty() {
-                msg.note(&format!("failed to create or modify \"{}\"", file));
+                msg.note(format!("failed to create or modify \"{}\"", file));
             }
             Err(msg.emit())
         }
@@ -724,6 +733,7 @@ fn main_args(at_args: &[String]) -> MainResult {
             return if code == 0 {
                 Ok(())
             } else {
+                #[allow(deprecated)]
                 Err(ErrorGuaranteed::unchecked_claim_error_was_emitted())
             };
         }

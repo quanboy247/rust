@@ -1,5 +1,5 @@
 use crate::errors::{
-    AmbigousImpl, AmbigousReturn, AnnotationRequired, InferenceBadError, NeedTypeInfoInGenerator,
+    AmbiguousImpl, AmbiguousReturn, AnnotationRequired, InferenceBadError, NeedTypeInfoInGenerator,
     SourceKindMultiSuggestion, SourceKindSubdiag,
 };
 use crate::infer::error_reporting::TypeErrCtxt;
@@ -31,7 +31,7 @@ pub enum TypeAnnotationNeeded {
     /// ```
     E0282,
     /// An implementation cannot be chosen unambiguously because of lack of information.
-    /// ```compile_fail,E0283
+    /// ```compile_fail,E0790
     /// let _ = Default::default();
     /// ```
     E0283,
@@ -358,7 +358,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 bad_label,
             }
             .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic),
-            TypeAnnotationNeeded::E0283 => AmbigousImpl {
+            TypeAnnotationNeeded::E0283 => AmbiguousImpl {
                 span,
                 source_kind,
                 source_name,
@@ -368,7 +368,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 bad_label,
             }
             .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic),
-            TypeAnnotationNeeded::E0284 => AmbigousReturn {
+            TypeAnnotationNeeded::E0284 => AmbiguousReturn {
                 span,
                 source_kind,
                 source_name,
@@ -563,7 +563,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 bad_label: None,
             }
             .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic),
-            TypeAnnotationNeeded::E0283 => AmbigousImpl {
+            TypeAnnotationNeeded::E0283 => AmbiguousImpl {
                 span,
                 source_kind,
                 source_name: &name,
@@ -573,7 +573,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                 bad_label: None,
             }
             .into_diagnostic(&self.tcx.sess.parse_sess.span_diagnostic),
-            TypeAnnotationNeeded::E0284 => AmbigousReturn {
+            TypeAnnotationNeeded::E0284 => AmbiguousReturn {
                 span,
                 source_kind,
                 source_name: &name,
@@ -1191,11 +1191,14 @@ impl<'a, 'tcx> Visitor<'tcx> for FindInferSourceVisitor<'a, 'tcx> {
                 have_turbofish,
             } = args;
             let generics = tcx.generics_of(generics_def_id);
-            if let Some(argument_index) = generics
+            if let Some(mut argument_index) = generics
                 .own_substs(substs)
                 .iter()
                 .position(|&arg| self.generic_arg_contains_target(arg))
             {
+                if generics.parent.is_none() && generics.has_self {
+                    argument_index += 1;
+                }
                 let substs = self.infcx.resolve_vars_if_possible(substs);
                 let generic_args = &generics.own_substs_no_defaults(tcx, substs)
                     [generics.own_counts().lifetimes..];

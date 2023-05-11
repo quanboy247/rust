@@ -6,11 +6,11 @@
 // ignore-mips64
 // ignore-powerpc
 // ignore-powerpc64
-// ignore-powerpc64le
 // ignore-riscv64
 // ignore-s390x
 // ignore-sparc
 // ignore-sparc64
+// ignore-loongarch64
 
 #![warn(unused_attributes)]
 

@@ -12,7 +12,7 @@ use rustc_data_structures::intern::Interned;
 use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::undo_log::UndoLogs;
 use rustc_data_structures::unify as ut;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_middle::infer::unify_key::{RegionVidKey, UnifiedRegion};
 use rustc_middle::ty::ReStatic;
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -217,7 +217,7 @@ pub enum VerifyBound<'tcx> {
 /// and supplies a bound if it ended up being relevant. It's used in situations
 /// like this:
 ///
-/// ```rust
+/// ```rust,ignore (pseudo-Rust)
 /// fn foo<'a, 'b, T: SomeTrait<'a>>
 /// where
 ///    <T as SomeTrait<'a>>::Item: 'b
@@ -232,7 +232,7 @@ pub enum VerifyBound<'tcx> {
 /// In the [`VerifyBound`], this struct is enclosed in `Binder` to account
 /// for cases like
 ///
-/// ```rust
+/// ```rust,ignore (pseudo-Rust)
 /// where for<'a> <T as SomeTrait<'a>::Item: 'a
 /// ```
 ///

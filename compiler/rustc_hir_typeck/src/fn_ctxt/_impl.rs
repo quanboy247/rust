@@ -63,9 +63,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     lint::builtin::UNREACHABLE_CODE,
                     id,
                     span,
-                    &msg,
+                    msg.clone(),
                     |lint| {
-                        lint.span_label(span, &msg).span_label(
+                        lint.span_label(span, msg).span_label(
                             orig_span,
                             custom_note
                                 .unwrap_or("any code following this expression is unreachable"),
@@ -275,7 +275,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     _ => {
                         self.tcx.sess.delay_span_bug(
                             expr.span,
-                            &format!(
+                            format!(
                                 "while adjusting {:?}, can't compose {:?} and {:?}",
                                 expr,
                                 entry.get(),
@@ -420,9 +420,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         ast_c: &hir::AnonConst,
         param_def_id: DefId,
     ) -> ty::Const<'tcx> {
-        let const_def =
-            ty::WithOptConstParam { did: ast_c.def_id, const_param_did: Some(param_def_id) };
-        let c = ty::Const::from_opt_const_arg_anon_const(self.tcx, const_def);
+        let did = ast_c.def_id;
+        self.tcx.feed_anon_const_type(did, self.tcx.type_of(param_def_id));
+        let c = ty::Const::from_anon_const(self.tcx, did);
         self.register_wf_obligation(
             c.into(),
             self.tcx.hir().span(ast_c.hir_id),
@@ -578,7 +578,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     #[instrument(skip(self), level = "debug")]
     pub(in super::super) fn report_ambiguity_errors(&self) {
-        let mut errors = self.fulfillment_cx.borrow_mut().collect_remaining_errors();
+        let mut errors = self.fulfillment_cx.borrow_mut().collect_remaining_errors(self);
 
         if !errors.is_empty() {
             self.adjust_fulfillment_errors_for_expr_obligation(&mut errors);
@@ -827,7 +827,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
             QPath::TypeRelative(ref qself, ref segment) => {
                 // Don't use `self.to_ty`, since this will register a WF obligation.
-                // If we're trying to call a non-existent method on a trait
+                // If we're trying to call a nonexistent method on a trait
                 // (e.g. `MyTrait::missing_method`), then resolution will
                 // give us a `QPath::TypeRelative` with a trait object as
                 // `qself`. In that case, we want to avoid registering a WF obligation
@@ -854,9 +854,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let result = self
             .resolve_fully_qualified_call(span, item_name, ty.normalized, qself.span, hir_id)
             .or_else(|error| {
+                let guar = self
+                    .tcx
+                    .sess
+                    .delay_span_bug(span, "method resolution should've emitted an error");
                 let result = match error {
                     method::MethodError::PrivateMatch(kind, def_id, _) => Ok((kind, def_id)),
-                    _ => Err(ErrorGuaranteed::unchecked_claim_error_was_emitted()),
+                    _ => Err(guar),
                 };
 
                 // If we have a path like `MyTrait::missing_method`, then don't register
@@ -1034,15 +1038,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 rcvr.span,
                 "you probably want to use this value after calling the method...",
             );
-            err.span_note(sp, &modifies_rcvr_note);
-            err.note(&format!("...instead of the `()` output of method `{}`", path_segment.ident));
+            err.span_note(sp, modifies_rcvr_note);
+            err.note(format!("...instead of the `()` output of method `{}`", path_segment.ident));
         } else if let ExprKind::MethodCall(..) = rcvr.kind {
             err.span_note(
                 sp,
                 modifies_rcvr_note.clone() + ", it is not meant to be used in method chains.",
             );
         } else {
-            err.span_note(sp, &modifies_rcvr_note);
+            err.span_note(sp, modifies_rcvr_note);
         }
     }
 
@@ -1374,7 +1378,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Err(_) => {
                     self.tcx.sess.delay_span_bug(
                         span,
-                        &format!(
+                        format!(
                         "instantiate_value_path: (UFCS) {:?} was a subtype of {:?} but now is not?",
                         self_ty,
                         impl_ty,

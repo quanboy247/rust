@@ -5,7 +5,7 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::graph::dominators::{self, Dominators};
 use rustc_data_structures::graph::{self, GraphSuccessors, WithNumNodes, WithStartNode};
 use rustc_index::bit_set::BitSet;
-use rustc_index::vec::{IndexSlice, IndexVec};
+use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::mir::coverage::*;
 use rustc_middle::mir::{self, BasicBlock, BasicBlockData, Terminator, TerminatorKind};
 
@@ -111,7 +111,7 @@ impl CoverageGraph {
                         if predecessors.len() > 1 {
                             "predecessors.len() > 1".to_owned()
                         } else {
-                            format!("bb {} is not in precessors: {:?}", bb.index(), predecessors)
+                            format!("bb {} is not in predecessors: {:?}", bb.index(), predecessors)
                         }
                     );
                 }
@@ -122,7 +122,7 @@ impl CoverageGraph {
 
             match term.kind {
                 TerminatorKind::Return { .. }
-                | TerminatorKind::Abort
+                | TerminatorKind::Terminate
                 | TerminatorKind::Yield { .. }
                 | TerminatorKind::SwitchInt { .. } => {
                     // The `bb` has more than one _outgoing_ edge, or exits the function. Save the
@@ -136,7 +136,7 @@ impl CoverageGraph {
                     debug!("  because term.kind = {:?}", term.kind);
                     // Note that this condition is based on `TerminatorKind`, even though it
                     // theoretically boils down to `successors().len() != 1`; that is, either zero
-                    // (e.g., `Return`, `Abort`) or multiple successors (e.g., `SwitchInt`), but
+                    // (e.g., `Return`, `Terminate`) or multiple successors (e.g., `SwitchInt`), but
                     // since the BCB CFG ignores things like unwind branches (which exist in the
                     // `Terminator`s `successors()` list) checking the number of successors won't
                     // work.

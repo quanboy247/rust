@@ -23,7 +23,6 @@ use rustc_mir_build as mir_build;
 use rustc_parse::{parse_crate_from_file, parse_crate_from_source_str, validate_attr};
 use rustc_passes::{self, hir_stats, layout_test};
 use rustc_plugin_impl as plugin;
-use rustc_query_impl::{OnDiskCache, Queries as TcxQueries};
 use rustc_resolve::Resolver;
 use rustc_session::config::{CrateType, Input, OutputFilenames, OutputType};
 use rustc_session::cstore::{MetadataLoader, Untracked};
@@ -230,7 +229,7 @@ fn configure_and_expand(
             features: Some(features),
             recursion_limit,
             trace_mac: sess.opts.unstable_opts.trace_macros,
-            should_test: sess.opts.test,
+            should_test: sess.is_test_crate(),
             span_debug: sess.opts.unstable_opts.span_debug,
             proc_macro_backtrace: sess.opts.unstable_opts.proc_macro_backtrace,
             ..rustc_expand::expand::ExpansionConfig::default(crate_name.to_string())
@@ -292,7 +291,7 @@ fn configure_and_expand(
     }
 
     sess.time("maybe_create_a_macro_crate", || {
-        let is_test_crate = sess.opts.test;
+        let is_test_crate = sess.is_test_crate();
         rustc_builtin_macros::proc_macro_harness::inject(
             &mut krate,
             sess,
@@ -669,7 +668,6 @@ pub fn create_global_ctxt<'tcx>(
     lint_store: Lrc<LintStore>,
     dep_graph: DepGraph,
     untracked: Untracked,
-    queries: &'tcx OnceCell<TcxQueries<'tcx>>,
     gcx_cell: &'tcx OnceCell<GlobalCtxt<'tcx>>,
     arena: &'tcx WorkerLocal<Arena<'tcx>>,
     hir_arena: &'tcx WorkerLocal<rustc_hir::Arena<'tcx>>,
@@ -693,10 +691,6 @@ pub fn create_global_ctxt<'tcx>(
         callback(sess, &mut local_providers, &mut extern_providers);
     }
 
-    let queries = queries.get_or_init(|| {
-        TcxQueries::new(local_providers, extern_providers, query_result_on_disk_cache)
-    });
-
     sess.time("setup_global_ctxt", || {
         gcx_cell.get_or_init(move || {
             TyCtxt::create_global_ctxt(
@@ -706,9 +700,9 @@ pub fn create_global_ctxt<'tcx>(
                 hir_arena,
                 untracked,
                 dep_graph,
-                queries.on_disk_cache.as_ref().map(OnDiskCache::as_dyn),
-                queries.as_dyn(),
+                query_result_on_disk_cache,
                 rustc_query_impl::query_callbacks(arena),
+                rustc_query_impl::query_system_fns(local_providers, extern_providers),
             )
         })
     })
@@ -761,27 +755,6 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
     // passes are timed inside typeck
     rustc_hir_analysis::check_crate(tcx)?;
 
-    sess.time("misc_checking_2", || {
-        parallel!(
-            {
-                sess.time("match_checking", || {
-                    tcx.hir().par_body_owners(|def_id| tcx.ensure().check_match(def_id.to_def_id()))
-                });
-            },
-            {
-                sess.time("liveness_checking", || {
-                    tcx.hir().par_body_owners(|def_id| {
-                        // this must run before MIR dump, because
-                        // "not all control paths return a value" is reported here.
-                        //
-                        // maybe move the check to a MIR pass?
-                        tcx.ensure().check_liveness(def_id.to_def_id());
-                    });
-                });
-            }
-        );
-    });
-
     sess.time("MIR_borrow_checking", || {
         tcx.hir().par_body_owners(|def_id| tcx.ensure().mir_borrowck(def_id));
     });
@@ -794,9 +767,14 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
             }
             tcx.ensure().has_ffi_unwind_calls(def_id);
 
-            if tcx.hir().body_const_context(def_id).is_some() {
-                tcx.ensure()
-                    .mir_drops_elaborated_and_const_checked(ty::WithOptConstParam::unknown(def_id));
+            // If we need to codegen, ensure that we emit all errors from
+            // `mir_drops_elaborated_and_const_checked` now, to avoid discovering
+            // them later during codegen.
+            if tcx.sess.opts.output_types.should_codegen()
+                || tcx.hir().body_const_context(def_id).is_some()
+            {
+                tcx.ensure().mir_drops_elaborated_and_const_checked(def_id);
+                tcx.ensure().unused_generic_params(ty::InstanceDef::Item(def_id.to_def_id()));
             }
         }
     });

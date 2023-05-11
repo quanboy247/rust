@@ -38,16 +38,14 @@ macro_rules! throw_validation_failure {
             msg.push_str(", but expected ");
             write!(&mut msg, $($expected_fmt)*).unwrap();
         )?
-        let path = rustc_middle::ty::print::with_no_trimmed_paths!({
-            let where_ = &$where;
-            if !where_.is_empty() {
-                let mut path = String::new();
-                write_path(&mut path, where_);
-                Some(path)
-            } else {
-                None
-            }
-        });
+        let where_ = &$where;
+        let path = if !where_.is_empty() {
+            let mut path = String::new();
+            write_path(&mut path, where_);
+            Some(path)
+        } else {
+            None
+        };
         throw_ub!(ValidationFailure { path, msg })
     }};
 }
@@ -784,7 +782,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
             Abi::Scalar(scalar_layout) => {
                 if !scalar_layout.is_uninit_valid() {
                     // There is something to check here.
-                    let scalar = self.read_scalar(op, "initiailized scalar value")?;
+                    let scalar = self.read_scalar(op, "initialized scalar value")?;
                     self.visit_scalar(scalar, scalar_layout)?;
                 }
             }
@@ -794,7 +792,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
                 // the other must be init.
                 if !a_layout.is_uninit_valid() && !b_layout.is_uninit_valid() {
                     let (a, b) =
-                        self.read_immediate(op, "initiailized scalar value")?.to_scalar_pair();
+                        self.read_immediate(op, "initialized scalar value")?.to_scalar_pair();
                     self.visit_scalar(a, a_layout)?;
                     self.visit_scalar(b, b_layout)?;
                 }

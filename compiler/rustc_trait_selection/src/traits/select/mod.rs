@@ -2,12 +2,6 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/traits/resolution.html#selection
 
-// FIXME: The `map` field in ProvisionalEvaluationCache should be changed to
-// a `FxIndexMap` to avoid query instability, but right now it causes a perf regression. This would be
-// fixed or at least lightened by the addition of the `drain_filter` method to `FxIndexMap`
-// Relevant: https://github.com/rust-lang/rust/pull/103723 and https://github.com/bluss/indexmap/issues/242
-#![allow(rustc::potential_query_instability)]
-
 use self::EvaluationResult::*;
 use self::SelectionCandidate::*;
 
@@ -32,8 +26,7 @@ use crate::traits::project::ProjectAndUnifyResult;
 use crate::traits::project::ProjectionCacheKeyExt;
 use crate::traits::ProjectionCacheKey;
 use crate::traits::Unimplemented;
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
+use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::Diagnostic;
 use rustc_hir as hir;
@@ -74,7 +67,7 @@ impl IntercrateAmbiguityCause {
     /// Emits notes when the overlap is caused by complex intercrate ambiguities.
     /// See #23980 for details.
     pub fn add_intercrate_ambiguity_hint(&self, err: &mut Diagnostic) {
-        err.note(&self.intercrate_ambiguity_hint());
+        err.note(self.intercrate_ambiguity_hint());
     }
 
     pub fn intercrate_ambiguity_hint(&self) -> String {
@@ -456,7 +449,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         debug!(?stack, ?candidates, "winnowed to {} candidates", candidates.len());
 
-        let needs_infer = stack.obligation.predicate.has_non_region_infer();
+        let has_non_region_infer = stack.obligation.predicate.has_non_region_infer();
 
         // If there are STILL multiple candidates, we can further
         // reduce the list by dropping duplicates -- including
@@ -468,7 +461,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     self.candidate_should_be_dropped_in_favor_of(
                         &candidates[i],
                         &candidates[j],
-                        needs_infer,
+                        has_non_region_infer,
                     ) == DropVictim::Yes
                 });
                 if should_drop_i {
@@ -895,7 +888,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                         let c1 = tcx.expand_abstract_consts(c1);
                         let c2 = tcx.expand_abstract_consts(c2);
                         debug!(
-                            "evalaute_predicate_recursively: equating consts:\nc1= {:?}\nc2= {:?}",
+                            "evaluate_predicate_recursively: equating consts:\nc1= {:?}\nc2= {:?}",
                             c1, c2
                         );
 
@@ -903,8 +896,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                         use ty::ConstKind::Unevaluated;
                         match (c1.kind(), c2.kind()) {
                             (Unevaluated(a), Unevaluated(b))
-                                if a.def.did == b.def.did
-                                    && tcx.def_kind(a.def.did) == DefKind::AssocConst =>
+                                if a.def == b.def && tcx.def_kind(a.def) == DefKind::AssocConst =>
                             {
                                 if let Ok(InferOk { obligations, value: () }) = self
                                     .infcx
@@ -1008,7 +1000,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
     ) -> Result<EvaluationResult, OverflowError> {
         if !self.is_intercrate()
             && obligation.is_global()
-            && obligation.param_env.caller_bounds().iter().all(|bound| bound.needs_subst())
+            && obligation.param_env.caller_bounds().iter().all(|bound| bound.has_param())
         {
             // If a param env has no global bounds, global obligations do not
             // depend on its particular value in order to work, so we can clear
@@ -1338,7 +1330,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         }
 
         if self.can_use_global_caches(param_env) {
-            if !trait_pred.needs_infer() {
+            if !trait_pred.has_infer() {
                 debug!(?trait_pred, ?result, "insert_evaluation_cache global");
                 // This may overwrite the cache with the same value
                 // FIXME: Due to #50507 this overwrites the different values
@@ -1524,7 +1516,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // If there are any inference variables in the `ParamEnv`, then we
         // always use a cache local to this particular scope. Otherwise, we
         // switch to a global cache.
-        if param_env.needs_infer() {
+        if param_env.has_infer() {
             return false;
         }
 
@@ -1595,7 +1587,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             return false;
         }
         match result {
-            Ok(Some(SelectionCandidate::ParamCandidate(trait_ref))) => !trait_ref.needs_infer(),
+            Ok(Some(SelectionCandidate::ParamCandidate(trait_ref))) => !trait_ref.has_infer(),
             _ => true,
         }
     }
@@ -1621,8 +1613,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         if self.can_use_global_caches(param_env) {
             if let Err(Overflow(OverflowError::Canonical)) = candidate {
                 // Don't cache overflow globally; we only produce this in certain modes.
-            } else if !pred.needs_infer() {
-                if !candidate.needs_infer() {
+            } else if !pred.has_infer() {
+                if !candidate.has_infer() {
                     debug!(?pred, ?candidate, "insert_candidate_cache global");
                     // This may overwrite the cache with the same value.
                     tcx.selection_cache.insert((param_env, pred), dep_node, candidate);
@@ -1732,7 +1724,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             .map(|InferOk { obligations: _, value: () }| {
                 // This method is called within a probe, so we can't have
                 // inference variables and placeholders escape.
-                if !trait_bound.needs_infer() && !trait_bound.has_placeholders() {
+                if !trait_bound.has_infer() && !trait_bound.has_placeholders() {
                     Some(trait_bound)
                 } else {
                     None
@@ -1848,7 +1840,7 @@ impl<'tcx> SelectionContext<'_, 'tcx> {
         &mut self,
         victim: &EvaluatedCandidate<'tcx>,
         other: &EvaluatedCandidate<'tcx>,
-        needs_infer: bool,
+        has_non_region_infer: bool,
     ) -> DropVictim {
         if victim.candidate == other.candidate {
             return DropVictim::Yes;
@@ -1964,7 +1956,7 @@ impl<'tcx> SelectionContext<'_, 'tcx> {
             | (ObjectCandidate(i), ObjectCandidate(j)) => {
                 // Arbitrarily pick the lower numbered candidate for backwards
                 // compatibility reasons. Don't let this affect inference.
-                DropVictim::drop_if(i < j && !needs_infer)
+                DropVictim::drop_if(i < j && !has_non_region_infer)
             }
             (ObjectCandidate(_), ProjectionCandidate(..))
             | (ProjectionCandidate(..), ObjectCandidate(_)) => {
@@ -2070,7 +2062,8 @@ impl<'tcx> SelectionContext<'_, 'tcx> {
                         // existence of multiple marker trait impls tells us nothing
                         // about which one should actually apply.
                         DropVictim::drop_if(
-                            !needs_infer && other.evaluation.must_apply_considering_regions(),
+                            !has_non_region_infer
+                                && other.evaluation.must_apply_considering_regions(),
                         )
                     }
                     None => DropVictim::No,
@@ -2322,7 +2315,7 @@ impl<'tcx> SelectionContext<'_, 'tcx> {
             | ty::Dynamic(..)
             | ty::Param(..)
             | ty::Foreign(..)
-            | ty::Alias(ty::Projection, ..)
+            | ty::Alias(ty::Projection | ty::Inherent, ..)
             | ty::Bound(..)
             | ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
                 bug!("asked to assemble constituent types of unexpected type: {:?}", t);
@@ -2420,7 +2413,7 @@ impl<'tcx> SelectionContext<'_, 'tcx> {
                     self.tcx(),
                     cause.clone(),
                     param_env,
-                    self.tcx().mk_trait_ref(trait_def_id, [normalized_ty]),
+                    ty::TraitRef::new(self.tcx(), trait_def_id, [normalized_ty]),
                 );
                 obligations.push(obligation);
                 obligations
@@ -2456,7 +2449,7 @@ impl<'tcx> SelectionContext<'_, 'tcx> {
                 // for a variable being generalized...
                 let guar = self.infcx.tcx.sess.delay_span_bug(
                     obligation.cause.span,
-                    &format!(
+                    format!(
                         "Impl {:?} was matchable against {:?} but now is not",
                         impl_def_id, obligation
                     ),
@@ -2782,7 +2775,7 @@ struct ProvisionalEvaluationCache<'tcx> {
     /// - then we determine that `E` is in error -- we will then clear
     ///   all cache values whose DFN is >= 4 -- in this case, that
     ///   means the cached value for `F`.
-    map: RefCell<FxHashMap<ty::PolyTraitPredicate<'tcx>, ProvisionalEvaluation>>,
+    map: RefCell<FxIndexMap<ty::PolyTraitPredicate<'tcx>, ProvisionalEvaluation>>,
 
     /// The stack of args that we assume to be true because a `WF(arg)` predicate
     /// is on the stack above (and because of wellformedness is coinductive).
@@ -2930,12 +2923,13 @@ impl<'tcx> ProvisionalEvaluationCache<'tcx> {
     /// have a performance impact in practice.
     fn on_completion(&self, dfn: usize) {
         debug!(?dfn, "on_completion");
-
-        for (fresh_trait_pred, eval) in
-            self.map.borrow_mut().drain_filter(|_k, eval| eval.from_dfn >= dfn)
-        {
-            debug!(?fresh_trait_pred, ?eval, "on_completion");
-        }
+        self.map.borrow_mut().retain(|fresh_trait_pred, eval| {
+            if eval.from_dfn >= dfn {
+                debug!(?fresh_trait_pred, ?eval, "on_completion");
+                return false;
+            }
+            true
+        });
     }
 }
 
@@ -3013,16 +3007,16 @@ fn bind_generator_hidden_types_above<'tcx>(
 
             // Only remap erased regions if we use them.
             if considering_regions {
-                ty = tcx.fold_regions(ty, |mut r, current_depth| {
-                    if let ty::ReErased = r.kind() {
+                ty = tcx.fold_regions(ty, |r, current_depth| match r.kind() {
+                    ty::ReErased => {
                         let br = ty::BoundRegion {
                             var: ty::BoundVar::from_u32(counter),
-                            kind: ty::BrAnon(counter, None),
+                            kind: ty::BrAnon(None),
                         };
                         counter += 1;
-                        r = tcx.mk_re_late_bound(current_depth, br);
+                        tcx.mk_re_late_bound(current_depth, br)
                     }
-                    r
+                    r => bug!("unexpected region: {r:?}"),
                 })
             }
 
@@ -3033,7 +3027,7 @@ fn bind_generator_hidden_types_above<'tcx>(
         debug_assert!(!hidden_types.has_erased_regions());
     }
     let bound_vars = tcx.mk_bound_variable_kinds_from_iter(bound_vars.iter().chain(
-        (num_bound_variables..counter).map(|i| ty::BoundVariableKind::Region(ty::BrAnon(i, None))),
+        (num_bound_variables..counter).map(|_| ty::BoundVariableKind::Region(ty::BrAnon(None))),
     ));
     ty::Binder::bind_with_vars(hidden_types, bound_vars)
 }

@@ -132,7 +132,7 @@ where
                             _ => {
                                 tcx.sess.delay_span_bug(
                                     tcx.hir().span_if_local(def_id).unwrap_or(DUMMY_SP),
-                                    &format!("unexpected generator witness type {:?}", witness),
+                                    format!("unexpected generator witness type {:?}", witness),
                                 );
                                 return Some(Err(AlwaysRequiresDrop));
                             }
@@ -243,7 +243,7 @@ fn drop_tys_helper<'tcx>(
         } else {
             let field_tys = adt_def.all_fields().map(|field| {
                 let r = tcx.type_of(field.did).subst(tcx, substs);
-                debug!("drop_tys_helper: Subst into {:?} with {:?} gettng {:?}", field, substs, r);
+                debug!("drop_tys_helper: Subst into {:?} with {:?} getting {:?}", field, substs, r);
                 r
             });
             if only_significant {

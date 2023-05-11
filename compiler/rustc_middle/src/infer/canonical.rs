@@ -35,9 +35,9 @@ use std::ops::Index;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TyDecodable, TyEncodable)]
 #[derive(HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct Canonical<'tcx, V> {
+    pub value: V,
     pub max_universe: ty::UniverseIndex,
     pub variables: CanonicalVarInfos<'tcx>,
-    pub value: V,
 }
 
 pub type CanonicalVarInfos<'tcx> = &'tcx List<CanonicalVarInfo<'tcx>>;
@@ -72,6 +72,18 @@ impl CanonicalVarValues<'_> {
             ty::GenericArgKind::Lifetime(r) => {
                 matches!(*r, ty::ReLateBound(ty::INNERMOST, br) if br.var.as_usize() == bv)
             }
+            ty::GenericArgKind::Type(ty) => {
+                matches!(*ty.kind(), ty::Bound(ty::INNERMOST, bt) if bt.var.as_usize() == bv)
+            }
+            ty::GenericArgKind::Const(ct) => {
+                matches!(ct.kind(), ty::ConstKind::Bound(ty::INNERMOST, bc) if bc.as_usize() == bv)
+            }
+        })
+    }
+
+    pub fn is_identity_modulo_regions(&self) -> bool {
+        self.var_values.iter().enumerate().all(|(bv, arg)| match arg.unpack() {
+            ty::GenericArgKind::Lifetime(_) => true,
             ty::GenericArgKind::Type(ty) => {
                 matches!(*ty.kind(), ty::Bound(ty::INNERMOST, bt) if bt.var.as_usize() == bv)
             }
@@ -149,15 +161,15 @@ impl<'tcx> CanonicalVarInfo<'tcx> {
         }
     }
 
-    pub fn expect_anon_placeholder(self) -> u32 {
+    pub fn expect_placeholder_index(self) -> usize {
         match self.kind {
             CanonicalVarKind::Ty(_)
             | CanonicalVarKind::Region(_)
             | CanonicalVarKind::Const(_, _) => bug!("expected placeholder: {self:?}"),
 
-            CanonicalVarKind::PlaceholderRegion(placeholder) => placeholder.name.expect_anon(),
-            CanonicalVarKind::PlaceholderTy(placeholder) => placeholder.name.expect_anon(),
-            CanonicalVarKind::PlaceholderConst(placeholder, _) => placeholder.name.as_u32(),
+            CanonicalVarKind::PlaceholderRegion(placeholder) => placeholder.bound.var.as_usize(),
+            CanonicalVarKind::PlaceholderTy(placeholder) => placeholder.bound.var.as_usize(),
+            CanonicalVarKind::PlaceholderConst(placeholder, _) => placeholder.bound.as_usize(),
         }
     }
 }
@@ -336,14 +348,6 @@ impl<'tcx, R> Canonical<'tcx, QueryResponse<'tcx, R>> {
     }
 }
 
-impl<'tcx, R> Canonical<'tcx, ty::ParamEnvAnd<'tcx, R>> {
-    #[inline]
-    pub fn without_const(mut self) -> Self {
-        self.value = self.value.without_const();
-        self
-    }
-}
-
 impl<'tcx, V> Canonical<'tcx, V> {
     /// Allows you to map the `value` of a canonical while keeping the
     /// same set of bound variables.
@@ -388,10 +392,8 @@ pub type QueryOutlivesConstraint<'tcx> =
     (ty::OutlivesPredicate<GenericArg<'tcx>, Region<'tcx>>, ConstraintCategory<'tcx>);
 
 TrivialTypeTraversalAndLiftImpls! {
-    for <'tcx> {
-        crate::infer::canonical::Certainty,
-        crate::infer::canonical::CanonicalTyVarKind,
-    }
+    crate::infer::canonical::Certainty,
+    crate::infer::canonical::CanonicalTyVarKind,
 }
 
 impl<'tcx> CanonicalVarValues<'tcx> {
@@ -411,7 +413,7 @@ impl<'tcx> CanonicalVarValues<'tcx> {
                         CanonicalVarKind::Region(_) | CanonicalVarKind::PlaceholderRegion(_) => {
                             let br = ty::BoundRegion {
                                 var: ty::BoundVar::from_usize(i),
-                                kind: ty::BrAnon(i as u32, None),
+                                kind: ty::BrAnon(None),
                             };
                             tcx.mk_re_late_bound(ty::INNERMOST, br).into()
                         }

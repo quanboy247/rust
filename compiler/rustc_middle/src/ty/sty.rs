@@ -7,18 +7,19 @@ use crate::ty::subst::{GenericArg, InternalSubsts, SubstsRef};
 use crate::ty::visit::ValidateBoundVars;
 use crate::ty::InferTy::*;
 use crate::ty::{
-    self, AdtDef, Discr, FallibleTypeFolder, Term, Ty, TyCtxt, TypeFlags, TypeFoldable,
-    TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+    self, AdtDef, Discr, Term, Ty, TyCtxt, TypeFlags, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt, TypeVisitor,
 };
 use crate::ty::{List, ParamEnv};
 use hir::def::DefKind;
 use polonius_engine::Atom;
 use rustc_data_structures::captures::Captures;
 use rustc_data_structures::intern::Interned;
+use rustc_errors::{DiagnosticArgValue, IntoDiagnosticArg};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::LangItem;
-use rustc_index::vec::Idx;
+use rustc_index::Idx;
 use rustc_macros::HashStable;
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_span::Span;
@@ -60,7 +61,7 @@ pub struct FreeRegion {
 #[derive(HashStable)]
 pub enum BoundRegionKind {
     /// An anonymous region parameter for a given fn (&T)
-    BrAnon(u32, Option<Span>),
+    BrAnon(Option<Span>),
 
     /// Named region parameters for functions (a in &'a T)
     ///
@@ -107,15 +108,6 @@ impl BoundRegionKind {
             _ => None,
         }
     }
-
-    pub fn expect_anon(&self) -> u32 {
-        match *self {
-            BoundRegionKind::BrNamed(_, _) | BoundRegionKind::BrEnv => {
-                bug!("expected anon region: {self:?}")
-            }
-            BoundRegionKind::BrAnon(idx, _) => idx,
-        }
-    }
 }
 
 pub trait Article {
@@ -135,10 +127,6 @@ impl<'tcx> Article for TyKind<'tcx> {
         }
     }
 }
-
-// `TyKind` is used a lot. Make sure it doesn't unintentionally get bigger.
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-static_assert_size!(TyKind<'_>, 32);
 
 /// A closure can be modeled as a struct that looks like:
 /// ```ignore (illustrative)
@@ -643,7 +631,7 @@ impl<'tcx> UpvarSubsts<'tcx> {
 /// type of the constant. The reason that `R` is represented as an extra type parameter
 /// is the same reason that [`ClosureSubsts`] have `CS` and `U` as type parameters:
 /// inline const can reference lifetimes that are internal to the creating function.
-#[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable)]
+#[derive(Copy, Clone, Debug)]
 pub struct InlineConstSubsts<'tcx> {
     /// Generic parameters from the enclosing item,
     /// concatenated with the inferred type of the constant.
@@ -739,13 +727,13 @@ impl<'tcx> PolyExistentialPredicate<'tcx> {
             ExistentialPredicate::AutoTrait(did) => {
                 let generics = tcx.generics_of(did);
                 let trait_ref = if generics.params.len() == 1 {
-                    tcx.mk_trait_ref(did, [self_ty])
+                    ty::TraitRef::new(tcx, did, [self_ty])
                 } else {
                     // If this is an ill-formed auto trait, then synthesize
                     // new error substs for the missing generics.
                     let err_substs =
                         ty::InternalSubsts::extend_with_error(tcx, did, &[self_ty.into()]);
-                    tcx.mk_trait_ref(did, err_substs)
+                    ty::TraitRef::new(tcx, did, err_substs)
                 };
                 self.rebind(trait_ref).without_const().to_predicate(tcx)
             }
@@ -832,27 +820,28 @@ pub struct TraitRef<'tcx> {
     pub def_id: DefId,
     pub substs: SubstsRef<'tcx>,
     /// This field exists to prevent the creation of `TraitRef` without
-    /// calling [TyCtxt::mk_trait_ref].
-    pub(super) _use_mk_trait_ref_instead: (),
+    /// calling [`TraitRef::new`].
+    pub(super) _use_trait_ref_new_instead: (),
 }
 
 impl<'tcx> TraitRef<'tcx> {
-    pub fn with_self_ty(self, tcx: TyCtxt<'tcx>, self_ty: Ty<'tcx>) -> Self {
-        tcx.mk_trait_ref(
-            self.def_id,
-            [self_ty.into()].into_iter().chain(self.substs.iter().skip(1)),
-        )
+    pub fn new(
+        tcx: TyCtxt<'tcx>,
+        trait_def_id: DefId,
+        substs: impl IntoIterator<Item: Into<GenericArg<'tcx>>>,
+    ) -> Self {
+        let substs = tcx.check_and_mk_substs(trait_def_id, substs);
+        Self { def_id: trait_def_id, substs, _use_trait_ref_new_instead: () }
     }
 
-    /// Returns a `TraitRef` of the form `P0: Foo<P1..Pn>` where `Pi`
-    /// are the parameters defined on trait.
-    pub fn identity(tcx: TyCtxt<'tcx>, def_id: DefId) -> Binder<'tcx, TraitRef<'tcx>> {
-        ty::Binder::dummy(tcx.mk_trait_ref(def_id, InternalSubsts::identity_for_item(tcx, def_id)))
-    }
-
-    #[inline]
-    pub fn self_ty(&self) -> Ty<'tcx> {
-        self.substs.type_at(0)
+    pub fn from_lang_item(
+        tcx: TyCtxt<'tcx>,
+        trait_lang_item: LangItem,
+        span: Span,
+        substs: impl IntoIterator<Item: Into<ty::GenericArg<'tcx>>>,
+    ) -> Self {
+        let trait_def_id = tcx.require_lang_item(trait_lang_item, Some(span));
+        Self::new(tcx, trait_def_id, substs)
     }
 
     pub fn from_method(
@@ -861,7 +850,38 @@ impl<'tcx> TraitRef<'tcx> {
         substs: SubstsRef<'tcx>,
     ) -> ty::TraitRef<'tcx> {
         let defs = tcx.generics_of(trait_id);
-        tcx.mk_trait_ref(trait_id, tcx.mk_substs(&substs[..defs.params.len()]))
+        ty::TraitRef::new(tcx, trait_id, tcx.mk_substs(&substs[..defs.params.len()]))
+    }
+
+    /// Returns a `TraitRef` of the form `P0: Foo<P1..Pn>` where `Pi`
+    /// are the parameters defined on trait.
+    pub fn identity(tcx: TyCtxt<'tcx>, def_id: DefId) -> TraitRef<'tcx> {
+        ty::TraitRef::new(tcx, def_id, InternalSubsts::identity_for_item(tcx, def_id))
+    }
+
+    pub fn with_self_ty(self, tcx: TyCtxt<'tcx>, self_ty: Ty<'tcx>) -> Self {
+        ty::TraitRef::new(
+            tcx,
+            self.def_id,
+            [self_ty.into()].into_iter().chain(self.substs.iter().skip(1)),
+        )
+    }
+
+    /// Converts this trait ref to a trait predicate with a given `constness` and a positive polarity.
+    #[inline]
+    pub fn with_constness(self, constness: ty::BoundConstness) -> ty::TraitPredicate<'tcx> {
+        ty::TraitPredicate { trait_ref: self, constness, polarity: ty::ImplPolarity::Positive }
+    }
+
+    /// Converts this trait ref to a trait predicate without `const` and a positive polarity.
+    #[inline]
+    pub fn without_const(self) -> ty::TraitPredicate<'tcx> {
+        self.with_constness(ty::BoundConstness::NotConst)
+    }
+
+    #[inline]
+    pub fn self_ty(&self) -> Ty<'tcx> {
+        self.substs.type_at(0)
     }
 }
 
@@ -877,8 +897,8 @@ impl<'tcx> PolyTraitRef<'tcx> {
     }
 }
 
-impl rustc_errors::IntoDiagnosticArg for PolyTraitRef<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
+impl<'tcx> IntoDiagnosticArg for TraitRef<'tcx> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
         self.to_string().into_diagnostic_arg()
     }
 }
@@ -919,7 +939,13 @@ impl<'tcx> ExistentialTraitRef<'tcx> {
         // otherwise the escaping vars would be captured by the binder
         // debug_assert!(!self_ty.has_escaping_bound_vars());
 
-        tcx.mk_trait_ref(self.def_id, [self_ty.into()].into_iter().chain(self.substs.iter()))
+        ty::TraitRef::new(tcx, self.def_id, [self_ty.into()].into_iter().chain(self.substs.iter()))
+    }
+}
+
+impl<'tcx> IntoDiagnosticArg for ExistentialTraitRef<'tcx> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+        self.to_string().into_diagnostic_arg()
     }
 }
 
@@ -936,12 +962,6 @@ impl<'tcx> PolyExistentialTraitRef<'tcx> {
     /// or some placeholder type.
     pub fn with_self_ty(&self, tcx: TyCtxt<'tcx>, self_ty: Ty<'tcx>) -> ty::PolyTraitRef<'tcx> {
         self.map_bound(|trait_ref| trait_ref.with_self_ty(tcx, self_ty))
-    }
-}
-
-impl rustc_errors::IntoDiagnosticArg for PolyExistentialTraitRef<'_> {
-    fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
-        self.to_string().into_diagnostic_arg()
     }
 }
 
@@ -1159,86 +1179,20 @@ impl<'tcx, T: IntoIterator> Binder<'tcx, T> {
     }
 }
 
-struct SkipBindersAt<'tcx> {
-    tcx: TyCtxt<'tcx>,
-    index: ty::DebruijnIndex,
-}
-
-impl<'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for SkipBindersAt<'tcx> {
-    type Error = ();
-
-    fn interner(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
-    fn try_fold_binder<T>(&mut self, t: Binder<'tcx, T>) -> Result<Binder<'tcx, T>, Self::Error>
-    where
-        T: ty::TypeFoldable<TyCtxt<'tcx>>,
-    {
-        self.index.shift_in(1);
-        let value = t.try_map_bound(|t| t.try_fold_with(self));
-        self.index.shift_out(1);
-        value
-    }
-
-    fn try_fold_ty(&mut self, ty: Ty<'tcx>) -> Result<Ty<'tcx>, Self::Error> {
-        if !ty.has_escaping_bound_vars() {
-            Ok(ty)
-        } else if let ty::Bound(index, bv) = *ty.kind() {
-            if index == self.index {
-                Err(())
-            } else {
-                Ok(self.interner().mk_bound(index.shifted_out(1), bv))
-            }
-        } else {
-            ty.try_super_fold_with(self)
-        }
-    }
-
-    fn try_fold_region(&mut self, r: ty::Region<'tcx>) -> Result<ty::Region<'tcx>, Self::Error> {
-        if !r.has_escaping_bound_vars() {
-            Ok(r)
-        } else if let ty::ReLateBound(index, bv) = r.kind() {
-            if index == self.index {
-                Err(())
-            } else {
-                Ok(self.interner().mk_re_late_bound(index.shifted_out(1), bv))
-            }
-        } else {
-            r.try_super_fold_with(self)
-        }
-    }
-
-    fn try_fold_const(&mut self, ct: ty::Const<'tcx>) -> Result<ty::Const<'tcx>, Self::Error> {
-        if !ct.has_escaping_bound_vars() {
-            Ok(ct)
-        } else if let ty::ConstKind::Bound(index, bv) = ct.kind() {
-            if index == self.index {
-                Err(())
-            } else {
-                Ok(self.interner().mk_const(
-                    ty::ConstKind::Bound(index.shifted_out(1), bv),
-                    ct.ty().try_fold_with(self)?,
-                ))
-            }
-        } else {
-            ct.try_super_fold_with(self)
-        }
-    }
-
-    fn try_fold_predicate(
-        &mut self,
-        p: ty::Predicate<'tcx>,
-    ) -> Result<ty::Predicate<'tcx>, Self::Error> {
-        if !p.has_escaping_bound_vars() { Ok(p) } else { p.try_super_fold_with(self) }
+impl<'tcx, T> IntoDiagnosticArg for Binder<'tcx, T>
+where
+    T: IntoDiagnosticArg,
+{
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+        self.0.into_diagnostic_arg()
     }
 }
 
 /// Represents the projection of an associated type.
 ///
-/// For a projection, this would be `<Ty as Trait<...>>::N`.
-///
-/// For an opaque type, there is no explicit syntax.
+/// * For a projection, this would be `<Ty as Trait<...>>::N<...>`.
+/// * For an inherent projection, this would be `Ty::N<...>`.
+/// * For an opaque type, there is no explicit syntax.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, TyEncodable, TyDecodable)]
 #[derive(HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct AliasTy<'tcx> {
@@ -1247,12 +1201,16 @@ pub struct AliasTy<'tcx> {
     /// For a projection, these are the substitutions for the trait and the
     /// GAT substitutions, if there are any.
     ///
+    /// For an inherent projection, they consist of the self type and the GAT substitutions,
+    /// if there are any.
+    ///
     /// For RPIT the substitutions are for the generics of the function,
     /// while for TAIT it is used for the generic parameters of the alias.
     pub substs: SubstsRef<'tcx>,
 
-    /// The `DefId` of the `TraitItem` for the associated type `N` if this is a projection,
-    /// or the `OpaqueType` item if this is an opaque.
+    /// The `DefId` of the `TraitItem` or `ImplItem` for the associated type `N` depending on whether
+    /// this is a projection or an inherent projection or the `DefId` of the `OpaqueType` item if
+    /// this is an opaque.
     ///
     /// During codegen, `tcx.type_of(def_id)` can be used to get the type of the
     /// underlying type if the type is an opaque.
@@ -1270,6 +1228,7 @@ pub struct AliasTy<'tcx> {
 impl<'tcx> AliasTy<'tcx> {
     pub fn kind(self, tcx: TyCtxt<'tcx>) -> ty::AliasKind {
         match tcx.def_kind(self.def_id) {
+            DefKind::AssocTy if let DefKind::Impl { of_trait: false } = tcx.def_kind(tcx.parent(self.def_id)) => ty::Inherent,
             DefKind::AssocTy | DefKind::ImplTraitPlaceholder => ty::Projection,
             DefKind::OpaqueTy => ty::Opaque,
             kind => bug!("unexpected DefKind in AliasTy: {kind:?}"),
@@ -1282,6 +1241,17 @@ impl<'tcx> AliasTy<'tcx> {
 }
 
 /// The following methods work only with associated type projections.
+impl<'tcx> AliasTy<'tcx> {
+    pub fn self_ty(self) -> Ty<'tcx> {
+        self.substs.type_at(0)
+    }
+
+    pub fn with_self_ty(self, tcx: TyCtxt<'tcx>, self_ty: Ty<'tcx>) -> Self {
+        tcx.mk_alias_ty(self.def_id, [self_ty.into()].into_iter().chain(self.substs.iter().skip(1)))
+    }
+}
+
+/// The following methods work only with trait associated type projections.
 impl<'tcx> AliasTy<'tcx> {
     pub fn trait_def_id(self, tcx: TyCtxt<'tcx>) -> DefId {
         match tcx.def_kind(self.def_id) {
@@ -1304,7 +1274,7 @@ impl<'tcx> AliasTy<'tcx> {
         let trait_def_id = self.trait_def_id(tcx);
         let trait_generics = tcx.generics_of(trait_def_id);
         (
-            tcx.mk_trait_ref(trait_def_id, self.substs.truncate_to(tcx, trait_generics)),
+            ty::TraitRef::new(tcx, trait_def_id, self.substs.truncate_to(tcx, trait_generics)),
             &self.substs[trait_generics.count()..],
         )
     }
@@ -1318,15 +1288,30 @@ impl<'tcx> AliasTy<'tcx> {
     /// as well.
     pub fn trait_ref(self, tcx: TyCtxt<'tcx>) -> ty::TraitRef<'tcx> {
         let def_id = self.trait_def_id(tcx);
-        tcx.mk_trait_ref(def_id, self.substs.truncate_to(tcx, tcx.generics_of(def_id)))
+        ty::TraitRef::new(tcx, def_id, self.substs.truncate_to(tcx, tcx.generics_of(def_id)))
     }
+}
 
-    pub fn self_ty(self) -> Ty<'tcx> {
-        self.substs.type_at(0)
-    }
+/// The following methods work only with inherent associated type projections.
+impl<'tcx> AliasTy<'tcx> {
+    /// Transform the substitutions to have the given `impl` substs as the base and the GAT substs on top of that.
+    ///
+    /// Does the following transformation:
+    ///
+    /// ```text
+    /// [Self, P_0...P_m] -> [I_0...I_n, P_0...P_m]
+    ///
+    ///     I_i impl subst
+    ///     P_j GAT subst
+    /// ```
+    pub fn rebase_substs_onto_impl(
+        self,
+        impl_substs: ty::SubstsRef<'tcx>,
+        tcx: TyCtxt<'tcx>,
+    ) -> ty::SubstsRef<'tcx> {
+        debug_assert_eq!(self.kind(tcx), ty::Inherent);
 
-    pub fn with_self_ty(self, tcx: TyCtxt<'tcx>, self_ty: Ty<'tcx>) -> Self {
-        tcx.mk_alias_ty(self.def_id, [self_ty.into()].into_iter().chain(self.substs.iter().skip(1)))
+        tcx.mk_substs_from_iter(impl_substs.into_iter().chain(self.substs.into_iter().skip(1)))
     }
 }
 
@@ -1372,6 +1357,12 @@ impl<'tcx> FnSig<'tcx> {
             unsafety: hir::Unsafety::Normal,
             abi: abi::Abi::Rust,
         }
+    }
+}
+
+impl<'tcx> IntoDiagnosticArg for FnSig<'tcx> {
+    fn into_diagnostic_arg(self) -> DiagnosticArgValue<'static> {
+        self.to_string().into_diagnostic_arg()
     }
 }
 
@@ -1508,7 +1499,7 @@ pub struct ConstVid<'tcx> {
 rustc_index::newtype_index! {
     /// A **region** (lifetime) **v**ariable **ID**.
     #[derive(HashStable)]
-    #[debug_format = "'_#{}r"]
+    #[debug_format = "'?{}"]
     pub struct RegionVid {}
 }
 
@@ -1533,22 +1524,13 @@ pub struct BoundTy {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, TyEncodable, TyDecodable)]
 #[derive(HashStable)]
 pub enum BoundTyKind {
-    Anon(u32),
+    Anon,
     Param(DefId, Symbol),
-}
-
-impl BoundTyKind {
-    pub fn expect_anon(self) -> u32 {
-        match self {
-            BoundTyKind::Anon(i) => i,
-            _ => bug!(),
-        }
-    }
 }
 
 impl From<BoundVar> for BoundTy {
     fn from(var: BoundVar) -> Self {
-        BoundTy { var, kind: BoundTyKind::Anon(var.as_u32()) }
+        BoundTy { var, kind: BoundTyKind::Anon }
     }
 }
 
@@ -1627,19 +1609,24 @@ impl<'tcx> Region<'tcx> {
 
     pub fn get_name(self) -> Option<Symbol> {
         if self.has_name() {
-            let name = match *self {
+            match *self {
                 ty::ReEarlyBound(ebr) => Some(ebr.name),
                 ty::ReLateBound(_, br) => br.kind.get_name(),
                 ty::ReFree(fr) => fr.bound_region.get_name(),
                 ty::ReStatic => Some(kw::StaticLifetime),
-                ty::RePlaceholder(placeholder) => placeholder.name.get_name(),
+                ty::RePlaceholder(placeholder) => placeholder.bound.kind.get_name(),
                 _ => None,
-            };
-
-            return name;
+            }
+        } else {
+            None
         }
+    }
 
-        None
+    pub fn get_name_or_anon(self) -> Symbol {
+        match self.get_name() {
+            Some(name) => name,
+            None => sym::anon,
+        }
     }
 
     /// Is this region named by the user?
@@ -1650,7 +1637,7 @@ impl<'tcx> Region<'tcx> {
             ty::ReFree(fr) => fr.bound_region.is_named(),
             ty::ReStatic => true,
             ty::ReVar(..) => false,
-            ty::RePlaceholder(placeholder) => placeholder.name.is_named(),
+            ty::RePlaceholder(placeholder) => placeholder.bound.kind.is_named(),
             ty::ReErased => false,
             ty::ReError(_) => false,
         }
@@ -1773,10 +1760,10 @@ impl<'tcx> Region<'tcx> {
         matches!(self.kind(), ty::ReVar(_))
     }
 
-    pub fn as_var(self) -> Option<RegionVid> {
+    pub fn as_var(self) -> RegionVid {
         match self.kind() {
-            ty::ReVar(vid) => Some(vid),
-            _ => None,
+            ty::ReVar(vid) => vid,
+            _ => bug!("expected region {:?} to be of kind ReVar", self),
         }
     }
 }
@@ -1913,7 +1900,7 @@ impl<'tcx> Ty<'tcx> {
                         // The way we evaluate the `N` in `[T; N]` here only works since we use
                         // `simd_size_and_type` post-monomorphization. It will probably start to ICE
                         // if we use it in generic code. See the `simd-array-trait` ui test.
-                        (f0_len.eval_target_usize(tcx, ParamEnv::empty()) as u64, *f0_elem_ty)
+                        (f0_len.eval_target_usize(tcx, ParamEnv::empty()), *f0_elem_ty)
                     }
                     // Otherwise, the fields of this Adt are the SIMD components (and we assume they
                     // all have the same type).
@@ -2476,6 +2463,13 @@ impl<'tcx> Ty<'tcx> {
             _ => None,
         }
     }
+
+    pub fn is_c_void(self, tcx: TyCtxt<'_>) -> bool {
+        match self.kind() {
+            ty::Adt(adt, _) => tcx.lang_items().get(LangItem::CVoid) == Some(adt.did()),
+            _ => false,
+        }
+    }
 }
 
 /// Extra information about why we ended up with a particular variance.
@@ -2513,4 +2507,15 @@ impl<'tcx> VarianceDiagInfo<'tcx> {
             VarianceDiagInfo::Invariant { .. } => self,
         }
     }
+}
+
+// Some types are used a lot. Make sure they don't unintentionally get bigger.
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+mod size_asserts {
+    use super::*;
+    use rustc_data_structures::static_assert_size;
+    // tidy-alphabetical-start
+    static_assert_size!(RegionKind<'_>, 28);
+    static_assert_size!(TyKind<'_>, 32);
+    // tidy-alphabetical-end
 }

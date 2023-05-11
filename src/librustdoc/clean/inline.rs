@@ -111,7 +111,7 @@ pub(crate) fn try_inline(
             clean::ConstantItem(build_const(cx, did))
         }
         Res::Def(DefKind::Macro(kind), did) => {
-            let mac = build_macro(cx, did, name, import_def_id);
+            let mac = build_macro(cx, did, name, import_def_id, kind);
 
             let type_kind = match kind {
                 MacroKind::Bang => ItemType::Macro,
@@ -152,9 +152,9 @@ pub(crate) fn try_inline_glob(
             // reexported by the glob, e.g. because they are shadowed by something else.
             let reexports = cx
                 .tcx
-                .module_reexports(current_mod)
-                .unwrap_or_default()
+                .module_children_local(current_mod)
                 .iter()
+                .filter(|child| !child.reexport_chain.is_empty())
                 .filter_map(|child| child.res.opt_def_id())
                 .collect();
             let mut items = build_module_items(cx, did, visited, inlined_names, Some(&reexports));
@@ -529,7 +529,7 @@ pub(crate) fn build_impl(
             items: trait_items,
             polarity,
             kind: if utils::has_doc_flag(tcx, did, sym::fake_variadic) {
-                ImplKind::FakeVaradic
+                ImplKind::FakeVariadic
             } else {
                 ImplKind::Normal
             },
@@ -558,7 +558,7 @@ fn build_module_items(
     // If we're re-exporting a re-export it may actually re-export something in
     // two namespaces, so the target may be listed twice. Make sure we only
     // visit each node at most once.
-    for &item in cx.tcx.module_children(did).iter() {
+    for item in cx.tcx.module_children(did).iter() {
         if item.vis.is_public() {
             let res = item.res.expect_non_local();
             if let Some(def_id) = res.opt_def_id()
@@ -652,18 +652,24 @@ fn build_macro(
     def_id: DefId,
     name: Symbol,
     import_def_id: Option<DefId>,
+    macro_kind: MacroKind,
 ) -> clean::ItemKind {
     match CStore::from_tcx(cx.tcx).load_macro_untracked(def_id, cx.sess()) {
-        LoadedMacro::MacroDef(item_def, _) => {
-            if let ast::ItemKind::MacroDef(ref def) = item_def.kind {
-                let vis = cx.tcx.visibility(import_def_id.unwrap_or(def_id));
-                clean::MacroItem(clean::Macro {
-                    source: utils::display_macro_source(cx, name, def, def_id, vis),
-                })
-            } else {
-                unreachable!()
+        LoadedMacro::MacroDef(item_def, _) => match macro_kind {
+            MacroKind::Bang => {
+                if let ast::ItemKind::MacroDef(ref def) = item_def.kind {
+                    let vis = cx.tcx.visibility(import_def_id.unwrap_or(def_id));
+                    clean::MacroItem(clean::Macro {
+                        source: utils::display_macro_source(cx, name, def, def_id, vis),
+                    })
+                } else {
+                    unreachable!()
+                }
             }
-        }
+            MacroKind::Derive | MacroKind::Attr => {
+                clean::ProcMacroItem(clean::ProcMacro { kind: macro_kind, helpers: Vec::new() })
+            }
+        },
         LoadedMacro::ProcMacro(ext) => clean::ProcMacroItem(clean::ProcMacro {
             kind: ext.macro_kind(),
             helpers: ext.helper_attrs,
@@ -700,7 +706,12 @@ fn filter_non_trait_generics(trait_did: DefId, mut g: clean::Generics) -> clean:
 
     g.where_predicates.retain(|pred| match pred {
         clean::WherePredicate::BoundPredicate {
-            ty: clean::QPath(box clean::QPathData { self_type: clean::Generic(ref s), trait_, .. }),
+            ty:
+                clean::QPath(box clean::QPathData {
+                    self_type: clean::Generic(ref s),
+                    trait_: Some(trait_),
+                    ..
+                }),
             bounds,
             ..
         } => !(bounds.is_empty() || *s == kw::SelfUpper && trait_.def_id() == trait_did),

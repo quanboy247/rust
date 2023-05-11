@@ -17,12 +17,12 @@ use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::intern::Interned;
 use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
+use rustc_fluent_macro::fluent_messages;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, CRATE_DEF_ID};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{AssocItemKind, HirIdSet, ItemId, Node, PatKind};
-use rustc_macros::fluent_messages;
 use rustc_middle::bug;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::middle::privacy::{EffectiveVisibilities, Level};
@@ -127,18 +127,19 @@ where
 
     fn visit_projection_ty(&mut self, projection: ty::AliasTy<'tcx>) -> ControlFlow<V::BreakTy> {
         let tcx = self.def_id_visitor.tcx();
-        let (trait_ref, assoc_substs) =
-            if tcx.def_kind(projection.def_id) != DefKind::ImplTraitPlaceholder {
-                projection.trait_ref_and_own_substs(tcx)
-            } else {
-                // HACK(RPITIT): Remove this when RPITITs are lowered to regular assoc tys
-                let def_id = tcx.impl_trait_in_trait_parent_fn(projection.def_id);
-                let trait_generics = tcx.generics_of(def_id);
-                (
-                    tcx.mk_trait_ref(def_id, projection.substs.truncate_to(tcx, trait_generics)),
-                    &projection.substs[trait_generics.count()..],
-                )
-            };
+        let (trait_ref, assoc_substs) = if tcx.def_kind(projection.def_id)
+            != DefKind::ImplTraitPlaceholder
+        {
+            projection.trait_ref_and_own_substs(tcx)
+        } else {
+            // HACK(RPITIT): Remove this when RPITITs are lowered to regular assoc tys
+            let def_id = tcx.impl_trait_in_trait_parent_fn(projection.def_id);
+            let trait_generics = tcx.generics_of(def_id);
+            (
+                ty::TraitRef::new(tcx, def_id, projection.substs.truncate_to(tcx, trait_generics)),
+                &projection.substs[trait_generics.count()..],
+            )
+        };
         self.visit_trait(trait_ref)?;
         if self.def_id_visitor.shallow() {
             ControlFlow::Continue(())
@@ -242,6 +243,39 @@ where
                 // This will also visit substs if necessary, so we don't need to recurse.
                 return self.visit_projection_ty(proj);
             }
+            ty::Alias(ty::Inherent, data) => {
+                if self.def_id_visitor.skip_assoc_tys() {
+                    // Visitors searching for minimal visibility/reachability want to
+                    // conservatively approximate associated types like `Type::Alias`
+                    // as visible/reachable even if `Type` is private.
+                    // Ideally, associated types should be substituted in the same way as
+                    // free type aliases, but this isn't done yet.
+                    return ControlFlow::Continue(());
+                }
+
+                self.def_id_visitor.visit_def_id(
+                    data.def_id,
+                    "associated type",
+                    &LazyDefPathStr { def_id: data.def_id, tcx },
+                )?;
+
+                struct LazyDefPathStr<'tcx> {
+                    def_id: DefId,
+                    tcx: TyCtxt<'tcx>,
+                }
+                impl<'tcx> fmt::Display for LazyDefPathStr<'tcx> {
+                    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        write!(f, "{}", self.tcx.def_path_str(self.def_id))
+                    }
+                }
+
+                // This will also visit substs if necessary, so we don't need to recurse.
+                return if self.def_id_visitor.shallow() {
+                    ControlFlow::Continue(())
+                } else {
+                    data.substs.iter().try_for_each(|subst| subst.visit_with(self))
+                };
+            }
             ty::Dynamic(predicates, ..) => {
                 // All traits in the list are considered the "primary" part of the type
                 // and are visited by shallow visitors.
@@ -269,7 +303,7 @@ where
                     // and are visited by shallow visitors.
                     self.visit_predicates(ty::GenericPredicates {
                         parent: None,
-                        predicates: tcx.explicit_item_bounds(def_id),
+                        predicates: tcx.explicit_item_bounds(def_id).skip_binder(),
                     })?;
                 }
             }
@@ -515,16 +549,14 @@ impl<'tcx> EmbargoVisitor<'tcx> {
             let vis = self.tcx.local_visibility(item_id.owner_id.def_id);
             self.update_macro_reachable_def(item_id.owner_id.def_id, def_kind, vis, defining_mod);
         }
-        if let Some(exports) = self.tcx.module_reexports(module_def_id) {
-            for export in exports {
-                if export.vis.is_accessible_from(defining_mod, self.tcx) {
-                    if let Res::Def(def_kind, def_id) = export.res {
-                        if let Some(def_id) = def_id.as_local() {
-                            let vis = self.tcx.local_visibility(def_id);
-                            self.update_macro_reachable_def(def_id, def_kind, vis, defining_mod);
-                        }
-                    }
-                }
+        for child in self.tcx.module_children_local(module_def_id) {
+            // FIXME: Use module children for the logic above too.
+            if !child.reexport_chain.is_empty()
+                && child.vis.is_accessible_from(defining_mod, self.tcx)
+                && let Res::Def(def_kind, def_id) = child.res
+                && let Some(def_id) = def_id.as_local() {
+                let vis = self.tcx.local_visibility(def_id);
+                self.update_macro_reachable_def(def_id, def_kind, vis, defining_mod);
             }
         }
     }
@@ -1788,7 +1820,7 @@ impl SearchInterfaceForPrivateItemsVisitor<'_> {
     fn bounds(&mut self) -> &mut Self {
         self.visit_predicates(ty::GenericPredicates {
             parent: None,
-            predicates: self.tcx.explicit_item_bounds(self.item_def_id),
+            predicates: self.tcx.explicit_item_bounds(self.item_def_id).skip_binder(),
         });
         self
     }

@@ -7,7 +7,7 @@ use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::graph::scc::Sccs;
 use rustc_errors::Diagnostic;
 use rustc_hir::def_id::CRATE_DEF_ID;
-use rustc_index::vec::{IndexSlice, IndexVec};
+use rustc_index::{IndexSlice, IndexVec};
 use rustc_infer::infer::outlives::test_type_match;
 use rustc_infer::infer::region_constraints::{GenericKind, VarInfos, VerifyBound, VerifyIfEq};
 use rustc_infer::infer::{InferCtxt, NllRegionVariableOrigin, RegionVariableOrigin};
@@ -27,7 +27,7 @@ use crate::{
     },
     diagnostics::{RegionErrorKind, RegionErrors, UniverseInfo},
     member_constraints::{MemberConstraintSet, NllMemberConstraintIndex},
-    nll::{PoloniusOutput, ToRegionVid},
+    nll::PoloniusOutput,
     region_infer::reverse_sccs::ReverseSccGraph,
     region_infer::values::{
         LivenessValues, PlaceholderIndices, RegionElement, RegionValueElements, RegionValues,
@@ -76,7 +76,7 @@ pub struct RegionInferenceContext<'tcx> {
     /// Reverse of the SCC constraint graph --  i.e., an edge `A -> B` exists if
     /// `B: A`. This is used to compute the universal regions that are required
     /// to outlive a given SCC. Computed lazily.
-    rev_scc_graph: Option<Rc<ReverseSccGraph>>,
+    rev_scc_graph: Option<ReverseSccGraph>,
 
     /// The "R0 member of [R1..Rn]" constraints, indexed by SCC.
     member_constraints: Rc<MemberConstraintSet<'tcx, ConstraintSccIndex>>,
@@ -593,14 +593,14 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     /// Returns `true` if the region `r` contains the point `p`.
     ///
     /// Panics if called before `solve()` executes,
-    pub(crate) fn region_contains(&self, r: impl ToRegionVid, p: impl ToElementIndex) -> bool {
-        let scc = self.constraint_sccs.scc(r.to_region_vid());
+    pub(crate) fn region_contains(&self, r: RegionVid, p: impl ToElementIndex) -> bool {
+        let scc = self.constraint_sccs.scc(r);
         self.scc_values.contains(scc, p)
     }
 
     /// Returns access to the value of `r` for debugging purposes.
     pub(crate) fn region_value_str(&self, r: RegionVid) -> String {
-        let scc = self.constraint_sccs.scc(r.to_region_vid());
+        let scc = self.constraint_sccs.scc(r);
         self.scc_values.region_value_str(scc)
     }
 
@@ -608,24 +608,21 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         &'a self,
         r: RegionVid,
     ) -> impl Iterator<Item = ty::PlaceholderRegion> + 'a {
-        let scc = self.constraint_sccs.scc(r.to_region_vid());
+        let scc = self.constraint_sccs.scc(r);
         self.scc_values.placeholders_contained_in(scc)
     }
 
     /// Returns access to the value of `r` for debugging purposes.
     pub(crate) fn region_universe(&self, r: RegionVid) -> ty::UniverseIndex {
-        let scc = self.constraint_sccs.scc(r.to_region_vid());
+        let scc = self.constraint_sccs.scc(r);
         self.scc_universes[scc]
     }
 
     /// Once region solving has completed, this function will return
     /// the member constraints that were applied to the value of a given
     /// region `r`. See `AppliedMemberConstraint`.
-    pub(crate) fn applied_member_constraints(
-        &self,
-        r: impl ToRegionVid,
-    ) -> &[AppliedMemberConstraint] {
-        let scc = self.constraint_sccs.scc(r.to_region_vid());
+    pub(crate) fn applied_member_constraints(&self, r: RegionVid) -> &[AppliedMemberConstraint] {
+        let scc = self.constraint_sccs.scc(r);
         binary_search_util::binary_search_slice(
             &self.member_constraints_applied,
             |applied| applied.member_region_scc,
@@ -816,9 +813,9 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         // free region that must outlive the member region `R0` (`UB:
         // R0`). Therefore, we need only keep an option `O` if `UB: O`
         // for all UB.
-        let rev_scc_graph = self.reverse_scc_graph();
+        self.compute_reverse_scc_graph();
         let universal_region_relations = &self.universal_region_relations;
-        for ub in rev_scc_graph.upper_bounds(scc) {
+        for ub in self.rev_scc_graph.as_ref().unwrap().upper_bounds(scc) {
             debug!(?ub);
             choice_regions.retain(|&o_r| universal_region_relations.outlives(ub, o_r));
         }
@@ -1133,7 +1130,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
             let r_vid = self.to_region_vid(r);
             let r_scc = self.constraint_sccs.scc(r_vid);
 
-            // The challenge if this. We have some region variable `r`
+            // The challenge is this. We have some region variable `r`
             // whose value is a set of CFG points and universal
             // regions. We want to find if that set is *equivalent* to
             // any of the named regions found in the closure.
@@ -2234,7 +2231,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         r: RegionVid,
         body: &Body<'_>,
     ) -> Option<Location> {
-        let scc = self.constraint_sccs.scc(r.to_region_vid());
+        let scc = self.constraint_sccs.scc(r);
         let locations = self.scc_values.locations_outlived_by(scc);
         for location in locations {
             let bb = &body[location.block];

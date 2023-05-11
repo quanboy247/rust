@@ -29,7 +29,7 @@ use rustc_session::lint::builtin::{
 };
 use rustc_session::parse::feature_err;
 use rustc_span::symbol::{kw, sym, Symbol};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{BytePos, Span, DUMMY_SP};
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::infer::{TyCtxtInferExt, ValuePairs};
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
@@ -101,12 +101,11 @@ impl CheckAttrVisitor<'_> {
         item: Option<ItemLike<'_>>,
     ) {
         let mut doc_aliases = FxHashMap::default();
-        let mut is_valid = true;
         let mut specified_inline = None;
         let mut seen = FxHashMap::default();
         let attrs = self.tcx.hir().attrs(hir_id);
         for attr in attrs {
-            let attr_is_valid = match attr.name_or_empty() {
+            match attr.name_or_empty() {
                 sym::do_not_recommend => self.check_do_not_recommend(attr.span, target),
                 sym::inline => self.check_inline(hir_id, attr, span, target),
                 sym::no_coverage => self.check_no_coverage(hir_id, attr, span, target),
@@ -188,7 +187,6 @@ impl CheckAttrVisitor<'_> {
                 sym::link_ordinal => self.check_link_ordinal(&attr, span, target),
                 _ => true,
             };
-            is_valid &= attr_is_valid;
 
             // lint-only checks
             match attr.name_or_empty() {
@@ -253,10 +251,6 @@ impl CheckAttrVisitor<'_> {
             }
 
             self.check_unused_attribute(hir_id, attr)
-        }
-
-        if !is_valid {
-            return;
         }
 
         self.check_repr(attrs, span, target, item, hir_id);
@@ -927,30 +921,18 @@ impl CheckAttrVisitor<'_> {
         hir_id: HirId,
     ) -> bool {
         if hir_id != CRATE_HIR_ID {
-            self.tcx.struct_span_lint_hir(
+            // insert a bang between `#` and `[...`
+            let bang_span = attr.span.lo() + BytePos(1);
+            let sugg = (attr.style == AttrStyle::Outer
+                && self.tcx.hir().get_parent_item(hir_id) == CRATE_OWNER_ID)
+                .then_some(errors::AttrCrateLevelOnlySugg {
+                    attr: attr.span.with_lo(bang_span).with_hi(bang_span),
+                });
+            self.tcx.emit_spanned_lint(
                 INVALID_DOC_ATTRIBUTES,
                 hir_id,
                 meta.span(),
-                fluent::passes_attr_crate_level,
-                |err| {
-                    if attr.style == AttrStyle::Outer
-                        && self.tcx.hir().get_parent_item(hir_id) == CRATE_OWNER_ID
-                    {
-                        if let Ok(mut src) = self.tcx.sess.source_map().span_to_snippet(attr.span) {
-                            src.insert(1, '!');
-                            err.span_suggestion_verbose(
-                                attr.span,
-                                fluent::passes_suggestion,
-                                src,
-                                Applicability::MaybeIncorrect,
-                            );
-                        } else {
-                            err.span_help(attr.span, fluent::passes_help);
-                        }
-                    }
-                    err.note(fluent::passes_note);
-                    err
-                },
+                errors::AttrCrateLevelOnly { sugg },
             );
             return false;
         }
@@ -1728,7 +1710,9 @@ impl CheckAttrVisitor<'_> {
                     }
                 }
                 sym::align => {
-                    if let (Target::Fn, false) = (target, self.tcx.features().fn_align) {
+                    if let (Target::Fn | Target::Method(MethodKind::Inherent), false) =
+                        (target, self.tcx.features().fn_align)
+                    {
                         feature_err(
                             &self.tcx.sess.parse_sess,
                             sym::fn_align,
@@ -1739,10 +1723,14 @@ impl CheckAttrVisitor<'_> {
                     }
 
                     match target {
-                        Target::Struct | Target::Union | Target::Enum | Target::Fn => continue,
+                        Target::Struct
+                        | Target::Union
+                        | Target::Enum
+                        | Target::Fn
+                        | Target::Method(_) => continue,
                         _ => {
                             self.tcx.sess.emit_err(
-                                errors::AttrApplication::StructEnumFunctionUnion {
+                                errors::AttrApplication::StructEnumFunctionMethodUnion {
                                     hint_span: hint.span(),
                                     span,
                                 },

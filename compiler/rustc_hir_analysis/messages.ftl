@@ -35,6 +35,10 @@ hir_analysis_field_already_declared =
 
 hir_analysis_expected_used_symbol = expected `used`, `used(compiler)` or `used(linker)`
 
+hir_analysis_const_param_ty_impl_on_non_adt =
+    the trait `ConstParamTy` may not be implemented for this type
+    .label = type is not a structure or enumeration
+
 hir_analysis_ambiguous_lifetime_bound =
     ambiguous lifetime bound, explicit lifetime bound required
 
@@ -188,4 +192,102 @@ hir_analysis_return_type_notation_equality_bound =
     return type notation is not allowed to use type equality
 
 hir_analysis_return_type_notation_missing_method =
-    cannot find associated function `{$assoc_name}` in trait `{$trait_name}`
+    cannot find associated function `{$assoc_name}` for `{$ty_name}`
+
+hir_analysis_return_type_notation_conflicting_bound =
+    ambiguous associated function `{$assoc_name}` for `{$ty_name}`
+    .note = `{$assoc_name}` is declared in two supertraits: `{$first_bound}` and `{$second_bound}`
+
+hir_analysis_placeholder_not_allowed_item_signatures = the placeholder `_` is not allowed within types on item signatures for {$kind}
+    .label = not allowed in type signatures
+
+hir_analysis_associated_type_trait_uninferred_generic_params = cannot use the associated type of a trait with uninferred generic parameters
+    .suggestion = use a fully qualified path with inferred lifetimes
+
+hir_analysis_associated_type_trait_uninferred_generic_params_multipart_suggestion = use a fully qualified path with explicit lifetimes
+
+hir_analysis_enum_discriminant_overflowed = enum discriminant overflowed
+    .label = overflowed on value after {$discr}
+    .note = explicitly set `{$item_name} = {$wrapped_discr}` if that is desired outcome
+
+hir_analysis_paren_sugar_attribute = the `#[rustc_paren_sugar]` attribute is a temporary means of controlling which traits can use parenthetical notation
+    .help = add `#![feature(unboxed_closures)]` to the crate attributes to use it
+
+hir_analysis_must_implement_one_of_attribute = the `#[rustc_must_implement_one_of]` attribute must be used with at least 2 args
+
+hir_analysis_must_be_name_of_associated_function = must be a name of an associated function
+
+hir_analysis_function_not_have_default_implementation = function doesn't have a default implementation
+    .note = required by this annotation
+
+hir_analysis_must_implement_not_function = not a function
+
+hir_analysis_must_implement_not_function_span_note = required by this annotation
+
+hir_analysis_must_implement_not_function_note = all `#[rustc_must_implement_one_of]` arguments must be associated function names
+
+hir_analysis_function_not_found_in_trait = function not found in this trait
+
+hir_analysis_functions_names_duplicated = functions names are duplicated
+    .note = all `#[rustc_must_implement_one_of]` arguments must be unique
+
+hir_analysis_simd_ffi_highly_experimental = use of SIMD type{$snip} in FFI is highly experimental and may result in invalid code
+    .help = add `#![feature(simd_ffi)]` to the crate attributes to enable
+
+hir_analysis_impl_not_marked_default = `{$ident}` specializes an item from a parent `impl`, but that item is not marked `default`
+    .label = cannot specialize default item `{$ident}`
+    .ok_label = parent `impl` is here
+    .note = to specialize, `{$ident}` in the parent `impl` must be marked `default`
+
+hir_analysis_impl_not_marked_default_err = `{$ident}` specializes an item from a parent `impl`, but that item is not marked `default`
+    .note = parent implementation is in crate `{$cname}`
+
+hir_analysis_missing_trait_item = not all trait items implemented, missing: `{$missing_items_msg}`
+    .label = missing `{$missing_items_msg}` in implementation
+
+hir_analysis_missing_trait_item_suggestion = implement the missing item: `{$snippet}`
+
+hir_analysis_missing_trait_item_label = `{$item}` from trait
+
+hir_analysis_missing_one_of_trait_item = not all trait items implemented, missing one of: `{$missing_items_msg}`
+    .label = missing one of `{$missing_items_msg}` in implementation
+    .note = required because of this annotation
+
+hir_analysis_missing_trait_item_unstable = not all trait items implemented, missing: `{$missing_item_name}`
+    .note = default implementation of `{$missing_item_name}` is unstable
+    .some_note = use of unstable library feature '{$feature}': {$r}
+    .none_note = use of unstable library feature '{$feature}'
+
+hir_analysis_transparent_enum_variant = transparent enum needs exactly one variant, but has {$number}
+    .label = needs exactly one variant, but has {$number}
+    .many_label = too many variants in `{$path}`
+    .multi_label = variant here
+
+hir_analysis_transparent_non_zero_sized_enum = the variant of a transparent {$desc} needs at most one non-zero-sized field, but has {$field_count}
+    .label = needs at most one non-zero-sized field, but has {$field_count}
+    .labels = this field is non-zero-sized
+
+hir_analysis_transparent_non_zero_sized = transparent {$desc} needs at most one non-zero-sized field, but has {$field_count}
+    .label = needs at most one non-zero-sized field, but has {$field_count}
+    .labels = this field is non-zero-sized
+
+hir_analysis_too_large_static = extern static is too large for the current architecture
+
+hir_analysis_specialization_trait = implementing `rustc_specialization_trait` traits is unstable
+    .help = add `#![feature(min_specialization)]` to the crate attributes to enable
+
+hir_analysis_closure_implicit_hrtb = implicit types in closure signatures are forbidden when `for<...>` is present
+    .label = `for<...>` is here
+
+hir_analysis_empty_specialization = specialization impl does not specialize any associated items
+    .note = impl is a specialization of this impl
+
+hir_analysis_const_specialize = cannot specialize on const impl with non-const impl
+
+hir_analysis_static_specialize = cannot specialize on `'static` lifetime
+
+hir_analysis_missing_tilde_const = missing `~const` qualifier for specialization
+
+hir_analysis_drop_impl_negative = negative `Drop` impls are not supported
+
+hir_analysis_drop_impl_reservation = reservation `Drop` impls are not supported

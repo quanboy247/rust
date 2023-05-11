@@ -3,7 +3,7 @@
 use std::marker::PhantomData;
 
 use rustc_index::bit_set::BitSet;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_middle::mir::{self, BasicBlock, Location};
 use rustc_middle::ty;
 use rustc_span::DUMMY_SP;
@@ -39,7 +39,7 @@ fn mock_body<'tcx>() -> mir::Body<'tcx> {
             args: vec![],
             destination: dummy_place.clone(),
             target: Some(mir::START_BLOCK),
-            cleanup: None,
+            unwind: mir::UnwindAction::Continue,
             from_hir_call: false,
             fn_span: DUMMY_SP,
         },
@@ -53,7 +53,7 @@ fn mock_body<'tcx>() -> mir::Body<'tcx> {
             args: vec![],
             destination: dummy_place.clone(),
             target: Some(mir::START_BLOCK),
-            cleanup: None,
+            unwind: mir::UnwindAction::Continue,
             from_hir_call: false,
             fn_span: DUMMY_SP,
         },

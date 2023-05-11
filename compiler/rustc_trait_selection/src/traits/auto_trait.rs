@@ -9,7 +9,6 @@ use crate::infer::InferCtxt;
 use crate::traits::project::ProjectAndUnifyResult;
 use rustc_infer::infer::DefineOpaqueTypes;
 use rustc_middle::mir::interpret::ErrorHandled;
-use rustc_middle::ty::fold::{TypeFolder, TypeSuperFoldable};
 use rustc_middle::ty::visit::TypeVisitableExt;
 use rustc_middle::ty::{ImplPolarity, Region, RegionVid};
 
@@ -87,7 +86,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
     ) -> AutoTraitResult<A> {
         let tcx = self.tcx;
 
-        let trait_ref = tcx.mk_trait_ref(trait_did, [ty]);
+        let trait_ref = ty::TraitRef::new(tcx, trait_did, [ty]);
 
         let infcx = tcx.infer_ctxt().build();
         let mut selcx = SelectionContext::new(&infcx);
@@ -187,7 +186,8 @@ impl<'tcx> AutoTraitFinder<'tcx> {
             panic!("Unable to fulfill trait {:?} for '{:?}': {:?}", trait_did, ty, errors);
         }
 
-        infcx.process_registered_region_obligations(&Default::default(), full_env);
+        let outlives_env = OutlivesEnvironment::new(full_env);
+        infcx.process_registered_region_obligations(&outlives_env);
 
         let region_data =
             infcx.inner.borrow_mut().unwrap_region_constraints().region_constraint_data().clone();
@@ -234,7 +234,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
     /// constructed once for a given type. As part of the construction process, the `ParamEnv` will
     /// have any supertrait bounds normalized -- e.g., if we have a type `struct Foo<T: Copy>`, the
     /// `ParamEnv` will contain `T: Copy` and `T: Clone`, since `Copy: Clone`. When we construct our
-    /// own `ParamEnv`, we need to do this ourselves, through `traits::elaborate_predicates`, or
+    /// own `ParamEnv`, we need to do this ourselves, through `traits::elaborate`, or
     /// else `SelectionContext` will choke on the missing predicates. However, this should never
     /// show up in the final synthesized generics: we don't want our generated docs page to contain
     /// something like `T: Copy + Clone`, as that's redundant. Therefore, we keep track of a
@@ -263,7 +263,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         let mut already_visited = FxHashSet::default();
         let mut predicates = VecDeque::new();
         predicates.push_back(ty::Binder::dummy(ty::TraitPredicate {
-            trait_ref: infcx.tcx.mk_trait_ref(trait_did, [ty]),
+            trait_ref: ty::TraitRef::new(infcx.tcx, trait_did, [ty]),
 
             constness: ty::BoundConstness::NotConst,
             // Auto traits are positive
@@ -346,10 +346,8 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                 _ => panic!("Unexpected error for '{:?}': {:?}", ty, result),
             };
 
-            let normalized_preds = elaborate_predicates(
-                tcx,
-                computed_preds.clone().chain(user_computed_preds.iter().cloned()),
-            );
+            let normalized_preds =
+                elaborate(tcx, computed_preds.clone().chain(user_computed_preds.iter().cloned()));
             new_env = ty::ParamEnv::new(
                 tcx.mk_predicates_from_iter(normalized_preds),
                 param_env.reveal(),
@@ -593,7 +591,7 @@ impl<'tcx> AutoTraitFinder<'tcx> {
     fn evaluate_nested_obligations(
         &self,
         ty: Ty<'_>,
-        nested: impl Iterator<Item = Obligation<'tcx, ty::Predicate<'tcx>>>,
+        nested: impl Iterator<Item = PredicateObligation<'tcx>>,
         computed_preds: &mut FxIndexSet<ty::Predicate<'tcx>>,
         fresh_preds: &mut FxHashSet<ty::Predicate<'tcx>>,
         predicates: &mut VecDeque<ty::PolyTraitPredicate<'tcx>>,
@@ -798,10 +796,9 @@ impl<'tcx> AutoTraitFinder<'tcx> {
                                 Ok(Some(valtree)) => Ok(selcx.tcx().mk_const(valtree, c.ty())),
                                 Ok(None) => {
                                     let tcx = self.tcx;
-                                    let def_id = unevaluated.def.did;
                                     let reported =
                                         tcx.sess.emit_err(UnableToConstructConstantValue {
-                                            span: tcx.def_span(def_id),
+                                            span: tcx.def_span(unevaluated.def),
                                             unevaluated: unevaluated,
                                         });
                                     Err(ErrorHandled::Reported(reported))
@@ -851,25 +848,5 @@ impl<'tcx> AutoTraitFinder<'tcx> {
         p: ty::Predicate<'tcx>,
     ) -> ty::Predicate<'tcx> {
         infcx.freshen(p)
-    }
-}
-
-/// Replaces all ReVars in a type with ty::Region's, using the provided map
-pub struct RegionReplacer<'a, 'tcx> {
-    vid_to_region: &'a FxHashMap<ty::RegionVid, ty::Region<'tcx>>,
-    tcx: TyCtxt<'tcx>,
-}
-
-impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for RegionReplacer<'a, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
-    fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
-        (match *r {
-            ty::ReVar(vid) => self.vid_to_region.get(&vid).cloned(),
-            _ => None,
-        })
-        .unwrap_or_else(|| r.super_fold_with(self))
     }
 }

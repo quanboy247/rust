@@ -10,7 +10,7 @@ use log::trace;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::Mutability;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_span::Span;
@@ -603,10 +603,11 @@ impl<'mir, 'tcx: 'mir> ThreadManager<'mir, 'tcx> {
         // this allows us to have a deterministic scheduler.
         for thread in self.threads.indices() {
             match self.timeout_callbacks.entry(thread) {
-                Entry::Occupied(entry) =>
+                Entry::Occupied(entry) => {
                     if entry.get().call_time.get_wait_time(clock) == Duration::new(0, 0) {
                         return Some((thread, entry.remove().callback));
-                    },
+                    }
+                }
                 Entry::Vacant(_) => {}
             }
         }
@@ -821,7 +822,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
 
         // Write the current thread-id, switch to the next thread later
-        // to treat this write operation as occuring on the current thread.
+        // to treat this write operation as occurring on the current thread.
         if let Some(thread_info_place) = thread {
             this.write_scalar(
                 Scalar::from_uint(new_thread_id.to_u32(), thread_info_place.layout.size),
@@ -830,7 +831,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
 
         // Finally switch to new thread so that we can push the first stackframe.
-        // After this all accesses will be treated as occuring in the new thread.
+        // After this all accesses will be treated as occurring in the new thread.
         let old_thread_id = this.set_active_thread(new_thread_id);
 
         // Perform the function pointer load in the new thread frame.

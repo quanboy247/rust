@@ -1,3 +1,4 @@
+use crate::errors;
 use rustc_ast::ast;
 use rustc_attr::InstructionSetAttr;
 use rustc_data_structures::fx::FxHashMap;
@@ -251,6 +252,7 @@ const RISCV_ALLOWED_FEATURES: &[(&str, Option<Symbol>)] = &[
     ("e", Some(sym::riscv_target_feature)),
     ("f", Some(sym::riscv_target_feature)),
     ("m", Some(sym::riscv_target_feature)),
+    ("relax", Some(sym::riscv_target_feature)),
     ("v", Some(sym::riscv_target_feature)),
     ("zba", Some(sym::riscv_target_feature)),
     ("zbb", Some(sym::riscv_target_feature)),
@@ -368,7 +370,7 @@ pub fn from_target_feature(
             let Some(feature_gate) = supported_target_features.get(feature) else {
                 let msg =
                     format!("the feature named `{}` is not valid for this target", feature);
-                let mut err = tcx.sess.struct_span_err(item.span(), &msg);
+                let mut err = tcx.sess.struct_span_err(item.span(), msg);
                 err.span_label(
                     item.span(),
                     format!("`{}` is not valid for this target", feature),
@@ -406,7 +408,7 @@ pub fn from_target_feature(
                     &tcx.sess.parse_sess,
                     feature_gate.unwrap(),
                     item.span(),
-                    &format!("the target feature `{}` is currently unstable", feature),
+                    format!("the target feature `{}` is currently unstable", feature),
                 )
                 .emit();
             }
@@ -442,14 +444,10 @@ pub fn check_target_feature_trait_unsafe(tcx: TyCtxt<'_>, id: LocalDefId, attr_s
     if let DefKind::AssocFn = tcx.def_kind(id) {
         let parent_id = tcx.local_parent(id);
         if let DefKind::Trait | DefKind::Impl { of_trait: true } = tcx.def_kind(parent_id) {
-            tcx.sess
-                .struct_span_err(
-                    attr_span,
-                    "`#[target_feature(..)]` cannot be applied to safe trait method",
-                )
-                .span_label(attr_span, "cannot be applied to safe trait method")
-                .span_label(tcx.def_span(id), "not an `unsafe` function")
-                .emit();
+            tcx.sess.emit_err(errors::TargetFeatureSafeTrait {
+                span: attr_span,
+                def: tcx.def_span(id),
+            });
         }
     }
 }

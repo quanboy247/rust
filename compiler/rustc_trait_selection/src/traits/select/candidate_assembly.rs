@@ -11,7 +11,7 @@ use hir::LangItem;
 use rustc_hir as hir;
 use rustc_infer::traits::ObligationCause;
 use rustc_infer::traits::{Obligation, SelectionError, TraitObligation};
-use rustc_middle::ty::fast_reject::{DeepRejectCtxt, TreatParams, TreatProjections};
+use rustc_middle::ty::fast_reject::{DeepRejectCtxt, TreatParams};
 use rustc_middle::ty::{self, Ty, TypeVisitableExt};
 
 use crate::traits;
@@ -57,6 +57,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         if obligation.polarity() == ty::ImplPolarity::Negative {
             self.assemble_candidates_for_trait_alias(obligation, &mut candidates);
             self.assemble_candidates_from_impls(obligation, &mut candidates);
+            self.assemble_candidates_from_caller_bounds(stack, &mut candidates)?;
         } else {
             self.assemble_candidates_for_trait_alias(obligation, &mut candidates);
 
@@ -97,7 +98,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             } else if lang_items.tuple_trait() == Some(def_id) {
                 self.assemble_candidate_for_tuple(obligation, &mut candidates);
             } else if lang_items.pointer_like() == Some(def_id) {
-                self.assemble_candidate_for_ptr_sized(obligation, &mut candidates);
+                self.assemble_candidate_for_pointer_like(obligation, &mut candidates);
             } else if lang_items.fn_ptr_trait() == Some(def_id) {
                 self.assemble_candidates_for_fn_ptr_trait(obligation, &mut candidates);
             } else {
@@ -187,6 +188,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         // Keep only those bounds which may apply, and propagate overflow if it occurs.
         for bound in matching_bounds {
+            if bound.skip_binder().polarity != stack.obligation.predicate.skip_binder().polarity {
+                continue;
+            }
+
             // FIXME(oli-obk): it is suspicious that we are dropping the constness and
             // polarity here.
             let wc = self.where_clause_may_apply(stack, bound.map_bound(|t| t.trait_ref))?;
@@ -294,7 +299,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             return;
         }
 
-        // Keep this funtion in sync with extract_tupled_inputs_and_output_from_callable
+        // Keep this function in sync with extract_tupled_inputs_and_output_from_callable
         // until the old solver (and thus this function) is removed.
 
         // Okay to skip binder because what we are inspecting doesn't involve bound regions.
@@ -406,7 +411,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
 
             match obligation.self_ty().skip_binder().kind() {
-                // Fast path to avoid evaluating an obligation that trivally holds.
+                // Fast path to avoid evaluating an obligation that trivially holds.
                 // There may be more bounds, but these are checked by the regular path.
                 ty::FnPtr(..) => return false,
                 // These may potentially implement `FnPtr`
@@ -454,7 +459,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 obligation.param_env,
                 self.tcx().mk_predicate(obligation.predicate.map_bound(|mut pred| {
                     pred.trait_ref =
-                        self.tcx().mk_trait_ref(fn_ptr_trait, [pred.trait_ref.self_ty()]);
+                        ty::TraitRef::new(self.tcx(), fn_ptr_trait, [pred.trait_ref.self_ty()]);
                     ty::PredicateKind::Clause(ty::Clause::Trait(pred))
                 })),
             );
@@ -493,7 +498,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     // this trait and type.
                 }
                 ty::Param(..)
-                | ty::Alias(ty::Projection, ..)
+                | ty::Alias(ty::Projection | ty::Inherent, ..)
                 | ty::Placeholder(..)
                 | ty::Bound(..) => {
                     // In these cases, we don't know what the actual
@@ -629,7 +634,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         }
 
         // <ty as Deref>
-        let trait_ref = tcx.mk_trait_ref(tcx.lang_items().deref_trait()?, [ty]);
+        let trait_ref = ty::TraitRef::new(tcx, tcx.lang_items().deref_trait()?, [ty]);
 
         let obligation =
             traits::Obligation::new(tcx, cause.clone(), param_env, ty::Binder::dummy(trait_ref));
@@ -775,7 +780,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
     ) {
-        if obligation.has_non_region_param() {
+        if obligation.predicate.has_non_region_param() {
             return;
         }
 
@@ -875,12 +880,24 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             }
 
             ty::Adt(..) => {
-                // Find a custom `impl Drop` impl, if it exists
-                let relevant_impl = self.tcx().find_map_relevant_impl(
+                let mut relevant_impl = None;
+                self.tcx().for_each_relevant_impl(
                     self.tcx().require_lang_item(LangItem::Drop, None),
                     obligation.predicate.skip_binder().trait_ref.self_ty(),
-                    TreatProjections::ForLookup,
-                    Some,
+                    |impl_def_id| {
+                        if let Some(old_impl_def_id) = relevant_impl {
+                            self.tcx()
+                                .sess
+                                .struct_span_err(
+                                    self.tcx().def_span(impl_def_id),
+                                    "multiple drop impls found",
+                                )
+                                .span_note(self.tcx().def_span(old_impl_def_id), "other impl here")
+                                .delay_as_bug();
+                        }
+
+                        relevant_impl = Some(impl_def_id);
+                    },
                 );
 
                 if let Some(impl_def_id) = relevant_impl {
@@ -942,15 +959,15 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         }
     }
 
-    fn assemble_candidate_for_ptr_sized(
+    fn assemble_candidate_for_pointer_like(
         &mut self,
         obligation: &TraitObligation<'tcx>,
         candidates: &mut SelectionCandidateSet<'tcx>,
     ) {
         // The regions of a type don't affect the size of the type
-        let self_ty = self
-            .tcx()
-            .erase_regions(self.tcx().erase_late_bound_regions(obligation.predicate.self_ty()));
+        let tcx = self.tcx();
+        let self_ty =
+            tcx.erase_regions(tcx.erase_late_bound_regions(obligation.predicate.self_ty()));
 
         // But if there are inference variables, we have to wait until it's resolved.
         if self_ty.has_non_region_infer() {
@@ -958,9 +975,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             return;
         }
 
-        if let Ok(layout) = self.tcx().layout_of(obligation.param_env.and(self_ty))
-            && layout.layout.size() == self.tcx().data_layout.pointer_size
-            && layout.layout.align().abi == self.tcx().data_layout.pointer_align.abi
+        if let Ok(layout) = tcx.layout_of(obligation.param_env.and(self_ty))
+            && layout.layout.is_pointer_like(&tcx.data_layout)
         {
             candidates.vec.push(BuiltinCandidate { has_nested: false });
         }

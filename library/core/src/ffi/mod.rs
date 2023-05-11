@@ -143,7 +143,10 @@ mod c_char_definition {
                     target_arch = "powerpc"
                 )
             ),
-            all(target_os = "fuchsia", target_arch = "aarch64"),
+            all(
+                target_os = "fuchsia",
+                any(target_arch = "aarch64", target_arch = "riscv64")
+            ),
             all(target_os = "nto", target_arch = "aarch64"),
             target_os = "horizon"
         ))] {
@@ -199,6 +202,7 @@ mod c_long_definition {
 //     would be uninhabited and at least dereferencing such pointers would
 //     be UB.
 #[doc = include_str!("c_void.md")]
+#[cfg_attr(not(bootstrap), lang = "c_void")]
 #[repr(u8)]
 #[stable(feature = "core_c_void", since = "1.30.0")]
 pub enum c_void {
@@ -615,12 +619,15 @@ impl<'f> Drop for VaListImpl<'f> {
 extern "rust-intrinsic" {
     /// Destroy the arglist `ap` after initialization with `va_start` or
     /// `va_copy`.
+    #[rustc_nounwind]
     fn va_end(ap: &mut VaListImpl<'_>);
 
     /// Copies the current location of arglist `src` to the arglist `dst`.
+    #[rustc_nounwind]
     fn va_copy<'f>(dest: *mut VaListImpl<'f>, src: &VaListImpl<'f>);
 
     /// Loads an argument of type `T` from the `va_list` `ap` and increment the
     /// argument `ap` points to.
+    #[rustc_nounwind]
     fn va_arg<T: sealed_trait::VaArgSafe>(ap: &mut VaListImpl<'_>) -> T;
 }

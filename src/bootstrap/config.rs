@@ -21,7 +21,7 @@ use crate::cache::{Interned, INTERNER};
 use crate::cc_detect::{ndk_compiler, Language};
 use crate::channel::{self, GitInfo};
 pub use crate::flags::Subcommand;
-use crate::flags::{Color, Flags};
+use crate::flags::{Color, Flags, Warnings};
 use crate::util::{exe, output, t};
 use once_cell::sync::OnceCell;
 use serde::{Deserialize, Deserializer};
@@ -56,8 +56,7 @@ pub enum DryRun {
 /// filled out from the decoded forms of the structs below. For documentation
 /// each field, see the corresponding fields in
 /// `config.example.toml`.
-#[derive(Default)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Clone)]
 pub struct Config {
     pub changelog_seen: Option<usize>,
     pub ccache: Option<String>,
@@ -77,7 +76,7 @@ pub struct Config {
     pub tools: Option<HashSet<String>>,
     pub sanitizers: bool,
     pub profiler: bool,
-    pub ignore_git: bool,
+    pub omit_git_hash: bool,
     pub exclude: Vec<TaskPath>,
     pub include_default_paths: bool,
     pub rustc_error_format: Option<String>,
@@ -227,27 +226,35 @@ pub struct Config {
     pub reuse: Option<PathBuf>,
     pub cargo_native_static: bool,
     pub configure_args: Vec<String>,
+    pub out: PathBuf,
+    pub rust_info: channel::GitInfo,
 
     // These are either the stage0 downloaded binaries or the locally installed ones.
     pub initial_cargo: PathBuf,
     pub initial_rustc: PathBuf,
+
     #[cfg(not(test))]
     initial_rustfmt: RefCell<RustfmtState>,
     #[cfg(test)]
     pub initial_rustfmt: RefCell<RustfmtState>,
-    pub out: PathBuf,
-    pub rust_info: channel::GitInfo,
+
+    pub paths: Vec<PathBuf>,
 }
 
-#[derive(Default, Deserialize)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Deserialize, Clone)]
 pub struct Stage0Metadata {
+    pub compiler: CompilerMetadata,
     pub config: Stage0Config,
     pub checksums_sha256: HashMap<String, String>,
     pub rustfmt: Option<RustfmtMetadata>,
 }
-#[derive(Default, Deserialize)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Deserialize, Clone)]
+pub struct CompilerMetadata {
+    pub date: String,
+    pub version: String,
+}
+
+#[derive(Default, Deserialize, Clone)]
 pub struct Stage0Config {
     pub dist_server: String,
     pub artifacts_server: String,
@@ -255,8 +262,7 @@ pub struct Stage0Config {
     pub git_merge_commit_email: String,
     pub nightly_branch: String,
 }
-#[derive(Default, Deserialize)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Deserialize, Clone)]
 pub struct RustfmtMetadata {
     pub date: String,
     pub version: String,
@@ -372,6 +378,16 @@ pub struct TargetSelection {
     file: Option<Interned<String>>,
 }
 
+/// Newtype over `Vec<TargetSelection>` so we can implement custom parsing logic
+#[derive(Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TargetSelectionList(Vec<TargetSelection>);
+
+pub fn target_selection_list(s: &str) -> Result<TargetSelectionList, String> {
+    Ok(TargetSelectionList(
+        s.split(",").filter(|s| !s.is_empty()).map(TargetSelection::from_user).collect(),
+    ))
+}
+
 impl TargetSelection {
     pub fn from_user(selection: &str) -> Self {
         let path = Path::new(selection);
@@ -434,8 +450,7 @@ impl PartialEq<&str> for TargetSelection {
 }
 
 /// Per-target configuration stored in the global configuration structure.
-#[derive(Default)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Default, Clone)]
 pub struct Target {
     /// Some(path to llvm-config) if using an external LLVM.
     pub llvm_config: Option<PathBuf>,
@@ -452,6 +467,7 @@ pub struct Target {
     pub ndk: Option<PathBuf>,
     pub sanitizers: Option<bool>,
     pub profiler: Option<bool>,
+    pub rpath: Option<bool>,
     pub crt_static: Option<bool>,
     pub musl_root: Option<PathBuf>,
     pub musl_libdir: Option<PathBuf>,
@@ -755,7 +771,7 @@ define_config! {
         verbose_tests: Option<bool> = "verbose-tests",
         optimize_tests: Option<bool> = "optimize-tests",
         codegen_tests: Option<bool> = "codegen-tests",
-        ignore_git: Option<bool> = "ignore-git",
+        omit_git_hash: Option<bool> = "omit-git-hash",
         dist_src: Option<bool> = "dist-src",
         save_toolstates: Option<String> = "save-toolstates",
         codegen_backends: Option<Vec<String>> = "codegen-backends",
@@ -797,6 +813,7 @@ define_config! {
         android_ndk: Option<String> = "android-ndk",
         sanitizers: Option<bool> = "sanitizers",
         profiler: Option<bool> = "profiler",
+        rpath: Option<bool> = "rpath",
         crt_static: Option<bool> = "crt-static",
         musl_root: Option<String> = "musl-root",
         musl_libdir: Option<String> = "musl-libdir",
@@ -868,26 +885,24 @@ impl Config {
     }
 
     fn parse_inner<'a>(args: &[String], get_toml: impl 'a + Fn(&Path) -> TomlConfig) -> Config {
-        let flags = Flags::parse(&args);
+        let mut flags = Flags::parse(&args);
         let mut config = Config::default_opts();
 
         // Set flags.
+        config.paths = std::mem::take(&mut flags.paths);
         config.exclude = flags.exclude.into_iter().map(|path| TaskPath::parse(path)).collect();
         config.include_default_paths = flags.include_default_paths;
         config.rustc_error_format = flags.rustc_error_format;
         config.json_output = flags.json_output;
         config.on_fail = flags.on_fail;
-        config.jobs = flags.jobs.map(threads_from_config);
+        config.jobs = Some(threads_from_config(flags.jobs as u32));
         config.cmd = flags.cmd;
         config.incremental = flags.incremental;
         config.dry_run = if flags.dry_run { DryRun::UserSelected } else { DryRun::Disabled };
         config.keep_stage = flags.keep_stage;
         config.keep_stage_std = flags.keep_stage_std;
         config.color = flags.color;
-        config.free_args = flags.free_args.clone().unwrap_or_default();
-        if let Some(value) = flags.deny_warnings {
-            config.deny_warnings = value;
-        }
+        config.free_args = std::mem::take(&mut flags.free_args);
         config.llvm_profile_use = flags.llvm_profile_use;
         config.llvm_profile_generate = flags.llvm_profile_generate;
         config.llvm_bolt_profile_generate = flags.llvm_bolt_profile_generate;
@@ -1000,13 +1015,15 @@ impl Config {
             config.out = crate::util::absolute(&config.out);
         }
 
-        config.initial_rustc = build
-            .rustc
-            .map(PathBuf::from)
-            .unwrap_or_else(|| config.out.join(config.build.triple).join("stage0/bin/rustc"));
+        config.initial_rustc = build.rustc.map(PathBuf::from).unwrap_or_else(|| {
+            config.download_beta_toolchain();
+            config.out.join(config.build.triple).join("stage0/bin/rustc")
+        });
         config.initial_cargo = build
             .cargo
-            .map(PathBuf::from)
+            .map(|cargo| {
+                t!(PathBuf::from(cargo).canonicalize(), "`initial_cargo` not found on disk")
+            })
             .unwrap_or_else(|| config.out.join(config.build.triple).join("stage0/bin/cargo"));
 
         // NOTE: it's important this comes *after* we set `initial_rustc` just above.
@@ -1016,14 +1033,14 @@ impl Config {
             config.out = dir;
         }
 
-        config.hosts = if let Some(arg_host) = flags.host {
+        config.hosts = if let Some(TargetSelectionList(arg_host)) = flags.host {
             arg_host
         } else if let Some(file_host) = build.host {
             file_host.iter().map(|h| TargetSelection::from_user(h)).collect()
         } else {
             vec![config.build]
         };
-        config.targets = if let Some(arg_target) = flags.target {
+        config.targets = if let Some(TargetSelectionList(arg_target)) = flags.target {
             arg_target
         } else if let Some(file_target) = build.target {
             file_target.iter().map(|h| TargetSelection::from_user(h)).collect()
@@ -1059,7 +1076,7 @@ impl Config {
         set(&mut config.print_step_rusage, build.print_step_rusage);
         set(&mut config.patch_binaries_for_nix, build.patch_binaries_for_nix);
 
-        config.verbose = cmp::max(config.verbose, flags.verbose);
+        config.verbose = cmp::max(config.verbose, flags.verbose as usize);
 
         if let Some(install) = toml.install {
             config.prefix = install.prefix.map(PathBuf::from);
@@ -1088,7 +1105,7 @@ impl Config {
         let mut debuginfo_level_tools = None;
         let mut debuginfo_level_tests = None;
         let mut optimize = None;
-        let mut ignore_git = None;
+        let mut omit_git_hash = None;
 
         if let Some(rust) = toml.rust {
             debug = rust.debug;
@@ -1109,7 +1126,7 @@ impl Config {
                 .map(|v| v.expect("invalid value for rust.split_debuginfo"))
                 .unwrap_or(SplitDebuginfo::default_for_platform(&config.build.triple));
             optimize = rust.optimize;
-            ignore_git = rust.ignore_git;
+            omit_git_hash = rust.omit_git_hash;
             config.rust_new_symbol_mangling = rust.new_symbol_mangling;
             set(&mut config.rust_optimize_tests, rust.optimize_tests);
             set(&mut config.codegen_tests, rust.codegen_tests);
@@ -1132,7 +1149,14 @@ impl Config {
             config.rustc_default_linker = rust.default_linker;
             config.musl_root = rust.musl_root.map(PathBuf::from);
             config.save_toolstates = rust.save_toolstates.map(PathBuf::from);
-            set(&mut config.deny_warnings, flags.deny_warnings.or(rust.deny_warnings));
+            set(
+                &mut config.deny_warnings,
+                match flags.warnings {
+                    Warnings::Deny => Some(true),
+                    Warnings::Warn => Some(false),
+                    Warnings::Default => rust.deny_warnings,
+                },
+            );
             set(&mut config.backtrace_on_ice, rust.backtrace_on_ice);
             set(&mut config.rust_verify_llvm_ir, rust.verify_llvm_ir);
             config.rust_thin_lto_import_instr_limit = rust.thin_lto_import_instr_limit;
@@ -1166,8 +1190,8 @@ impl Config {
 
         // rust_info must be set before is_ci_llvm_available() is called.
         let default = config.channel == "dev";
-        config.ignore_git = ignore_git.unwrap_or(default);
-        config.rust_info = GitInfo::new(config.ignore_git, &config.src);
+        config.omit_git_hash = omit_git_hash.unwrap_or(default);
+        config.rust_info = GitInfo::new(config.omit_git_hash, &config.src);
 
         if let Some(llvm) = toml.llvm {
             match llvm.ccache {
@@ -1296,6 +1320,7 @@ impl Config {
                 target.qemu_rootfs = cfg.qemu_rootfs.map(PathBuf::from);
                 target.sanitizers = cfg.sanitizers;
                 target.profiler = cfg.profiler;
+                target.rpath = cfg.rpath;
 
                 config.target_config.insert(TargetSelection::from_user(&triple), target);
             }
@@ -1304,7 +1329,7 @@ impl Config {
         if config.llvm_from_ci {
             let triple = &config.build.triple;
             let ci_llvm_bin = config.ci_llvm_root().join("bin");
-            let mut build_target = config
+            let build_target = config
                 .target_config
                 .entry(config.build)
                 .or_insert_with(|| Target::from_triple(&triple));
@@ -1387,7 +1412,8 @@ impl Config {
             | Subcommand::Fix { .. }
             | Subcommand::Run { .. }
             | Subcommand::Setup { .. }
-            | Subcommand::Format { .. } => flags.stage.unwrap_or(0),
+            | Subcommand::Format { .. }
+            | Subcommand::Suggest { .. } => flags.stage.unwrap_or(0),
         };
 
         // CI should always run stage 2 builds, unless it specifically states otherwise
@@ -1412,7 +1438,8 @@ impl Config {
                 | Subcommand::Fix { .. }
                 | Subcommand::Run { .. }
                 | Subcommand::Setup { .. }
-                | Subcommand::Format { .. } => {}
+                | Subcommand::Format { .. }
+                | Subcommand::Suggest { .. } => {}
             }
         }
 
@@ -1433,6 +1460,28 @@ impl Config {
         let mut git = Command::new("git");
         git.current_dir(&self.src);
         git
+    }
+
+    pub(crate) fn test_args(&self) -> Vec<&str> {
+        let mut test_args = match self.cmd {
+            Subcommand::Test { ref test_args, .. } | Subcommand::Bench { ref test_args, .. } => {
+                test_args.iter().flat_map(|s| s.split_whitespace()).collect()
+            }
+            _ => vec![],
+        };
+        test_args.extend(self.free_args.iter().map(|s| s.as_str()));
+        test_args
+    }
+
+    pub(crate) fn args(&self) -> Vec<&str> {
+        let mut args = match self.cmd {
+            Subcommand::Run { ref args, .. } => {
+                args.iter().flat_map(|s| s.split_whitespace()).collect()
+            }
+            _ => vec![],
+        };
+        args.extend(self.free_args.iter().map(|s| s.as_str()));
+        args
     }
 
     /// Bootstrap embeds a version number into the name of shared libraries it uploads in CI.
@@ -1601,6 +1650,10 @@ impl Config {
 
     pub fn any_profiler_enabled(&self) -> bool {
         self.target_config.values().any(|t| t.profiler == Some(true)) || self.profiler
+    }
+
+    pub fn rpath_enabled(&self, target: TargetSelection) -> bool {
+        self.target_config.get(&target).map(|t| t.rpath).flatten().unwrap_or(self.rust_rpath)
     }
 
     pub fn llvm_enabled(&self) -> bool {

@@ -163,13 +163,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 //
                 // [block: If(lhs)] -true-> [else_block: dest = (rhs)]
                 //        | (false)
-                //  [shortcurcuit_block: dest = false]
+                //  [shortcircuit_block: dest = false]
                 //
                 // Or:
                 //
                 // [block: If(lhs)] -false-> [else_block: dest = (rhs)]
                 //        | (true)
-                //  [shortcurcuit_block: dest = true]
+                //  [shortcircuit_block: dest = true]
 
                 let (shortcircuit_block, mut else_block, join_block) = (
                     this.cfg.start_new_block(),
@@ -228,7 +228,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     this.cfg.terminate(
                         loop_block,
                         source_info,
-                        TerminatorKind::FalseUnwind { real_target: body_block, unwind: None },
+                        TerminatorKind::FalseUnwind {
+                            real_target: body_block,
+                            unwind: UnwindAction::Continue,
+                        },
                     );
                     this.diverge_from(loop_block);
 
@@ -264,7 +267,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     TerminatorKind::Call {
                         func: fun,
                         args,
-                        cleanup: None,
+                        unwind: UnwindAction::Continue,
                         destination,
                         // The presence or absence of a return edge affects control-flow sensitive
                         // MIR checks and ultimately whether code is accepted or not. We can only
@@ -466,7 +469,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         } else {
                             Some(destination_block)
                         },
-                        cleanup: None,
+                        unwind: if options.contains(InlineAsmOptions::MAY_UNWIND) {
+                            UnwindAction::Continue
+                        } else {
+                            UnwindAction::Unreachable
+                        },
                     },
                 );
                 if options.contains(InlineAsmOptions::MAY_UNWIND) {
@@ -554,7 +561,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::ZstLiteral { .. }
             | ExprKind::ConstParam { .. }
             | ExprKind::ThreadLocalRef(_)
-            | ExprKind::StaticRef { .. } => {
+            | ExprKind::StaticRef { .. }
+            | ExprKind::OffsetOf { .. } => {
                 debug_assert!(match Category::of(&expr.kind).unwrap() {
                     // should be handled above
                     Category::Rvalue(RvalueFunc::Into) => false,

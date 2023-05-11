@@ -34,7 +34,7 @@ use crate::sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
     target_os = "watchos",
 ))]
 use crate::sys::weak::syscall;
-#[cfg(any(target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "android", target_os = "macos", target_os = "solaris"))]
 use crate::sys::weak::weak;
 
 use libc::{c_int, mode_t};
@@ -43,6 +43,7 @@ use libc::{c_int, mode_t};
     target_os = "macos",
     target_os = "ios",
     target_os = "watchos",
+    target_os = "solaris",
     all(target_os = "linux", target_env = "gnu")
 ))]
 use libc::c_char;
@@ -446,7 +447,12 @@ impl FileAttr {
 
 #[cfg(not(any(target_os = "netbsd", target_os = "nto")))]
 impl FileAttr {
-    #[cfg(not(any(target_os = "vxworks", target_os = "espidf", target_os = "horizon")))]
+    #[cfg(not(any(
+        target_os = "vxworks",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita"
+    )))]
     pub fn modified(&self) -> io::Result<SystemTime> {
         #[cfg(target_pointer_width = "32")]
         cfg_has_statx! {
@@ -458,7 +464,7 @@ impl FileAttr {
         Ok(SystemTime::new(self.stat.st_mtime as i64, self.stat.st_mtime_nsec as i64))
     }
 
-    #[cfg(any(target_os = "vxworks", target_os = "espidf"))]
+    #[cfg(any(target_os = "vxworks", target_os = "espidf", target_os = "vita"))]
     pub fn modified(&self) -> io::Result<SystemTime> {
         Ok(SystemTime::new(self.stat.st_mtime as i64, 0))
     }
@@ -468,7 +474,12 @@ impl FileAttr {
         Ok(SystemTime::from(self.stat.st_mtim))
     }
 
-    #[cfg(not(any(target_os = "vxworks", target_os = "espidf", target_os = "horizon")))]
+    #[cfg(not(any(
+        target_os = "vxworks",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita"
+    )))]
     pub fn accessed(&self) -> io::Result<SystemTime> {
         #[cfg(target_pointer_width = "32")]
         cfg_has_statx! {
@@ -480,7 +491,7 @@ impl FileAttr {
         Ok(SystemTime::new(self.stat.st_atime as i64, self.stat.st_atime_nsec as i64))
     }
 
-    #[cfg(any(target_os = "vxworks", target_os = "espidf"))]
+    #[cfg(any(target_os = "vxworks", target_os = "espidf", target_os = "vita"))]
     pub fn accessed(&self) -> io::Result<SystemTime> {
         Ok(SystemTime::new(self.stat.st_atime as i64, 0))
     }
@@ -546,6 +557,7 @@ impl FileAttr {
 }
 
 impl AsInner<stat64> for FileAttr {
+    #[inline]
     fn as_inner(&self) -> &stat64 {
         &self.stat
     }
@@ -864,6 +876,7 @@ impl DirEntry {
         target_os = "vxworks",
         target_os = "espidf",
         target_os = "horizon",
+        target_os = "vita",
         target_os = "nto",
     ))]
     pub fn ino(&self) -> u64 {
@@ -1192,8 +1205,6 @@ impl File {
                 None => Ok(libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT as _ }),
             }
         };
-        #[cfg(not(any(target_os = "redox", target_os = "espidf", target_os = "horizon")))]
-        let times = [to_timespec(times.accessed)?, to_timespec(times.modified)?];
         cfg_if::cfg_if! {
             if #[cfg(any(target_os = "redox", target_os = "espidf", target_os = "horizon"))] {
                 // Redox doesn't appear to support `UTIME_OMIT`.
@@ -1205,6 +1216,7 @@ impl File {
                     "setting file times not supported",
                 ))
             } else if #[cfg(any(target_os = "android", target_os = "macos"))] {
+                let times = [to_timespec(times.accessed)?, to_timespec(times.modified)?];
                 // futimens requires macOS 10.13, and Android API level 19
                 cvt(unsafe {
                     weak!(fn futimens(c_int, *const libc::timespec) -> c_int);
@@ -1231,6 +1243,22 @@ impl File {
                 })?;
                 Ok(())
             } else {
+                #[cfg(all(target_os = "linux", target_env = "gnu", target_pointer_width = "32", not(target_arch = "riscv32")))]
+                {
+                    use crate::sys::{time::__timespec64, weak::weak};
+
+                    // Added in glibc 2.34
+                    weak!(fn __futimens64(libc::c_int, *const __timespec64) -> libc::c_int);
+
+                    if let Some(futimens64) = __futimens64.get() {
+                        let to_timespec = |time: Option<SystemTime>| time.map(|time| time.t.to_timespec64())
+                            .unwrap_or(__timespec64::new(0, libc::UTIME_OMIT as _));
+                        let times = [to_timespec(times.accessed), to_timespec(times.modified)];
+                        cvt(unsafe { futimens64(self.as_raw_fd(), times.as_ptr()) })?;
+                        return Ok(());
+                    }
+                }
+                let times = [to_timespec(times.accessed)?, to_timespec(times.modified)?];
                 cvt(unsafe { libc::futimens(self.as_raw_fd(), times.as_ptr()) })?;
                 Ok(())
             }
@@ -1253,12 +1281,14 @@ impl DirBuilder {
 }
 
 impl AsInner<FileDesc> for File {
+    #[inline]
     fn as_inner(&self) -> &FileDesc {
         &self.0
     }
 }
 
 impl AsInnerMut<FileDesc> for File {
+    #[inline]
     fn as_inner_mut(&mut self) -> &mut FileDesc {
         &mut self.0
     }
@@ -1283,6 +1313,7 @@ impl AsFd for File {
 }
 
 impl AsRawFd for File {
+    #[inline]
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
     }
@@ -1497,8 +1528,8 @@ pub fn link(original: &Path, link: &Path) -> io::Result<()> {
                     // Android has `linkat` on newer versions, but we happen to know `link`
                     // always has the correct behavior, so it's here as well.
                     cvt(unsafe { libc::link(original.as_ptr(), link.as_ptr()) })?;
-                } else if #[cfg(target_os = "macos")] {
-                    // On MacOS, older versions (<=10.9) lack support for linkat while newer
+                } else if #[cfg(any(target_os = "macos", target_os = "solaris"))] {
+                    // MacOS (<=10.9) and Solaris 10 lack support for linkat while newer
                     // versions have it. We want to use linkat if it is available, so we use weak!
                     // to check. `linkat` is preferable to `link` because it gives us a flag to
                     // specify how symlinks should be handled. We pass 0 as the flags argument,
@@ -1892,7 +1923,7 @@ mod remove_dir_impl {
         // file descriptor is automatically closed by libc::closedir() now, so give up ownership
         let new_parent_fd = dir_fd.into_raw_fd();
         // a valid root is not needed because we do not call any functions involving the full path
-        // of the DirEntrys.
+        // of the `DirEntry`s.
         let dummy_root = PathBuf::new();
         let inner = InnerReadDir { dirp, root: dummy_root };
         Ok((ReadDir::new(inner), new_parent_fd))

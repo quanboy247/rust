@@ -4,8 +4,9 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Write};
-use std::fs::{self};
+use std::fs::{self, File};
 use std::hash::Hash;
+use std::io::{BufRead, BufReader};
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -28,8 +29,12 @@ use crate::{clean, dist};
 use crate::{Build, CLang, DocTests, GitRepo, Mode};
 
 pub use crate::Compiler;
-// FIXME: replace with std::lazy after it gets stabilized and reaches beta
-use once_cell::sync::Lazy;
+// FIXME:
+// - use std::lazy for `Lazy`
+// - use std::cell for `OnceCell`
+// Once they get stabilized and reach beta.
+use clap::ValueEnum;
+use once_cell::sync::{Lazy, OnceCell};
 
 pub struct Builder<'a> {
     pub build: &'a Build,
@@ -484,17 +489,43 @@ impl<'a> ShouldRun<'a> {
 
     // multiple aliases for the same job
     pub fn paths(mut self, paths: &[&str]) -> Self {
+        static SUBMODULES_PATHS: OnceCell<Vec<String>> = OnceCell::new();
+
+        let init_submodules_paths = |src: &PathBuf| {
+            let file = File::open(src.join(".gitmodules")).unwrap();
+
+            let mut submodules_paths = vec![];
+            for line in BufReader::new(file).lines() {
+                if let Ok(line) = line {
+                    let line = line.trim();
+
+                    if line.starts_with("path") {
+                        let actual_path =
+                            line.split(' ').last().expect("Couldn't get value of path");
+                        submodules_paths.push(actual_path.to_owned());
+                    }
+                }
+            }
+
+            submodules_paths
+        };
+
+        let submodules_paths =
+            SUBMODULES_PATHS.get_or_init(|| init_submodules_paths(&self.builder.src));
+
         self.paths.insert(PathSet::Set(
             paths
                 .iter()
                 .map(|p| {
-                    // FIXME(#96188): make sure this is actually a path.
-                    // This currently breaks for paths within submodules.
-                    //assert!(
-                    //    self.builder.src.join(p).exists(),
-                    //    "`should_run.paths` should correspond to real on-disk paths - use `alias` if there is no relevant path: {}",
-                    //    p
-                    //);
+                    // assert only if `p` isn't submodule
+                    if !submodules_paths.iter().find(|sm_p| p.contains(*sm_p)).is_some() {
+                        assert!(
+                            self.builder.src.join(p).exists(),
+                            "`should_run.paths` should correspond to real on-disk paths - use `alias` if there is no relevant path: {}",
+                            p
+                        );
+                    }
+
                     TaskPath { path: p.into(), kind: Some(self.kind) }
                 })
                 .collect(),
@@ -546,21 +577,27 @@ impl<'a> ShouldRun<'a> {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum)]
 pub enum Kind {
+    #[clap(alias = "b")]
     Build,
+    #[clap(alias = "c")]
     Check,
     Clippy,
     Fix,
     Format,
+    #[clap(alias = "t")]
     Test,
     Bench,
+    #[clap(alias = "d")]
     Doc,
     Clean,
     Dist,
     Install,
+    #[clap(alias = "r")]
     Run,
     Setup,
+    Suggest,
 }
 
 impl Kind {
@@ -580,6 +617,7 @@ impl Kind {
             "install" => Kind::Install,
             "run" | "r" => Kind::Run,
             "setup" => Kind::Setup,
+            "suggest" => Kind::Suggest,
             _ => return None,
         })
     }
@@ -599,6 +637,15 @@ impl Kind {
             Kind::Install => "install",
             Kind::Run => "run",
             Kind::Setup => "setup",
+            Kind::Suggest => "suggest",
+        }
+    }
+
+    pub fn test_description(&self) -> &'static str {
+        match self {
+            Kind::Test => "Testing",
+            Kind::Bench => "Benchmarking",
+            _ => panic!("not a test command: {}!", self.as_str()),
         }
     }
 }
@@ -662,7 +709,6 @@ impl<'a> Builder<'a> {
                 crate::toolstate::ToolStateCheck,
                 test::ExpandYamlAnchors,
                 test::Tidy,
-                test::TidySelfTest,
                 test::Ui,
                 test::RunPassValgrind,
                 test::MirOpt,
@@ -678,10 +724,9 @@ impl<'a> Builder<'a> {
                 test::CrateLibrustc,
                 test::CrateRustdoc,
                 test::CrateRustdocJsonTypes,
-                test::CrateJsonDocLint,
+                test::CrateBootstrap,
                 test::Linkcheck,
                 test::TierCheck,
-                test::ReplacePlaceholderTest,
                 test::Cargotest,
                 test::Cargo,
                 test::RustAnalyzer,
@@ -793,11 +838,12 @@ impl<'a> Builder<'a> {
                 run::Miri,
                 run::CollectLicenseMetadata,
                 run::GenerateCopyright,
+                run::GenerateWindowsSys,
             ),
             Kind::Setup => describe!(setup::Profile, setup::Hook, setup::Link, setup::Vscode),
             Kind::Clean => describe!(clean::CleanAll, clean::Rustc, clean::Std),
             // special-cased in Build::build()
-            Kind::Format => vec![],
+            Kind::Format | Kind::Suggest => vec![],
         }
     }
 
@@ -848,24 +894,41 @@ impl<'a> Builder<'a> {
     }
 
     pub fn new(build: &Build) -> Builder<'_> {
+        let paths = &build.config.paths;
         let (kind, paths) = match build.config.cmd {
-            Subcommand::Build { ref paths } => (Kind::Build, &paths[..]),
-            Subcommand::Check { ref paths } => (Kind::Check, &paths[..]),
-            Subcommand::Clippy { ref paths, .. } => (Kind::Clippy, &paths[..]),
-            Subcommand::Fix { ref paths } => (Kind::Fix, &paths[..]),
-            Subcommand::Doc { ref paths, .. } => (Kind::Doc, &paths[..]),
-            Subcommand::Test { ref paths, .. } => (Kind::Test, &paths[..]),
-            Subcommand::Bench { ref paths, .. } => (Kind::Bench, &paths[..]),
-            Subcommand::Dist { ref paths } => (Kind::Dist, &paths[..]),
-            Subcommand::Install { ref paths } => (Kind::Install, &paths[..]),
-            Subcommand::Run { ref paths, .. } => (Kind::Run, &paths[..]),
-            Subcommand::Clean { ref paths, .. } => (Kind::Clean, &paths[..]),
+            Subcommand::Build => (Kind::Build, &paths[..]),
+            Subcommand::Check { .. } => (Kind::Check, &paths[..]),
+            Subcommand::Clippy { .. } => (Kind::Clippy, &paths[..]),
+            Subcommand::Fix => (Kind::Fix, &paths[..]),
+            Subcommand::Doc { .. } => (Kind::Doc, &paths[..]),
+            Subcommand::Test { .. } => (Kind::Test, &paths[..]),
+            Subcommand::Bench { .. } => (Kind::Bench, &paths[..]),
+            Subcommand::Dist => (Kind::Dist, &paths[..]),
+            Subcommand::Install => (Kind::Install, &paths[..]),
+            Subcommand::Run { .. } => (Kind::Run, &paths[..]),
+            Subcommand::Clean { .. } => (Kind::Clean, &paths[..]),
             Subcommand::Format { .. } => (Kind::Format, &[][..]),
+            Subcommand::Suggest { .. } => (Kind::Suggest, &[][..]),
             Subcommand::Setup { profile: ref path } => (
                 Kind::Setup,
                 path.as_ref().map_or([].as_slice(), |path| std::slice::from_ref(path)),
             ),
         };
+
+        Self::new_internal(build, kind, paths.to_owned())
+    }
+
+    /// Creates a new standalone builder for use outside of the normal process
+    pub fn new_standalone(
+        build: &mut Build,
+        kind: Kind,
+        paths: Vec<PathBuf>,
+        stage: Option<u32>,
+    ) -> Builder<'_> {
+        // FIXME: don't mutate `build`
+        if let Some(stage) = stage {
+            build.config.stage = stage;
+        }
 
         Self::new_internal(build, kind, paths.to_owned())
     }
@@ -958,9 +1021,24 @@ impl<'a> Builder<'a> {
                 // Avoid deleting the rustlib/ directory we just copied
                 // (in `impl Step for Sysroot`).
                 if !builder.download_rustc() {
+                    builder.verbose(&format!(
+                        "Removing sysroot {} to avoid caching bugs",
+                        sysroot.display()
+                    ));
                     let _ = fs::remove_dir_all(&sysroot);
                     t!(fs::create_dir_all(&sysroot));
                 }
+
+                if self.compiler.stage == 0 {
+                    // The stage 0 compiler for the build triple is always pre-built.
+                    // Ensure that `libLLVM.so` ends up in the target libdir, so that ui-fulldeps tests can use it when run.
+                    dist::maybe_install_llvm_target(
+                        builder,
+                        self.compiler.host,
+                        &builder.sysroot(self.compiler),
+                    );
+                }
+
                 INTERNER.intern_path(sysroot)
             }
         }
@@ -1334,7 +1412,7 @@ impl<'a> Builder<'a> {
 
         // Add extra cfg not defined in/by rustc
         //
-        // Note: Altrough it would seems that "-Zunstable-options" to `rustflags` is useless as
+        // Note: Although it would seems that "-Zunstable-options" to `rustflags` is useless as
         // cargo would implicitly add it, it was discover that sometimes bootstrap only use
         // `rustflags` without `cargo` making it required.
         rustflags.arg("-Zunstable-options");
@@ -1524,8 +1602,8 @@ impl<'a> Builder<'a> {
         // which adds to the runtime dynamic loader path when looking for
         // dynamic libraries. We use this by default on Unix platforms to ensure
         // that our nightlies behave the same on Windows, that is they work out
-        // of the box. This can be disabled, of course, but basically that's why
-        // we're gated on RUSTC_RPATH here.
+        // of the box. This can be disabled by setting `rpath = false` in `[rust]`
+        // table of `config.toml`
         //
         // Ok, so the astute might be wondering "why isn't `-C rpath` used
         // here?" and that is indeed a good question to ask. This codegen
@@ -1545,7 +1623,7 @@ impl<'a> Builder<'a> {
         // argument manually via `-C link-args=-Wl,-rpath,...`. Plus isn't it
         // fun to pass a flag to a tool to pass a flag to pass a flag to a tool
         // to change a flag in a binary?
-        if self.config.rust_rpath && util::use_host_linker(target) {
+        if self.config.rpath_enabled(target) && util::use_host_linker(target) {
             let rpath = if target.contains("apple") {
                 // Note that we need to take one extra step on macOS to also pass
                 // `-Wl,-instal_name,@rpath/...` to get things to work right. To
@@ -1980,7 +2058,7 @@ impl<'a> Builder<'a> {
         }
 
         #[cfg(feature = "build-metrics")]
-        self.metrics.enter_step(&step);
+        self.metrics.enter_step(&step, self);
 
         let (out, dur) = {
             let start = Instant::now();
@@ -2006,7 +2084,7 @@ impl<'a> Builder<'a> {
         }
 
         #[cfg(feature = "build-metrics")]
-        self.metrics.exit_step();
+        self.metrics.exit_step(self);
 
         {
             let mut stack = self.stack.borrow_mut();
@@ -2081,6 +2159,10 @@ impl<'a> Builder<'a> {
 #[cfg(test)]
 mod tests;
 
+/// Represents flag values in `String` form with whitespace delimiter to pass it to the compiler later.
+///
+/// `-Z crate-attr` flags will be applied recursively on the target code using the `rustc_parse::parser::Parser`.
+/// See `rustc_builtin_macros::cmdline_attrs::inject` for more information.
 #[derive(Debug, Clone)]
 struct Rustflags(String, TargetSelection);
 

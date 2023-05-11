@@ -2,7 +2,7 @@ use crate::abi::FnAbiLlvmExt;
 use crate::attributes;
 use crate::common::Funclet;
 use crate::context::CodegenCx;
-use crate::llvm::{self, AtomicOrdering, AtomicRmwBinOp, BasicBlock};
+use crate::llvm::{self, AtomicOrdering, AtomicRmwBinOp, BasicBlock, False, True};
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
@@ -15,14 +15,15 @@ use rustc_codegen_ssa::traits::*;
 use rustc_codegen_ssa::MemFlags;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_hir::def_id::DefId;
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers, TyAndLayout,
 };
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::Span;
-use rustc_symbol_mangling::typeid::kcfi_typeid_for_fnabi;
+use rustc_symbol_mangling::typeid::{kcfi_typeid_for_fnabi, typeid_for_fnabi, TypeIdOptions};
 use rustc_target::abi::{self, call::FnAbi, Align, Size, WrappingRange};
-use rustc_target::spec::{HasTargetSpec, Target};
+use rustc_target::spec::{HasTargetSpec, SanitizerSet, Target};
 use std::borrow::Cow;
 use std::ffi::CStr;
 use std::iter;
@@ -216,6 +217,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     fn invoke(
         &mut self,
         llty: &'ll Type,
+        fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: &'ll Value,
         args: &[&'ll Value],
@@ -230,19 +232,13 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         let funclet_bundle = funclet_bundle.as_ref().map(|b| &*b.raw);
         let mut bundles = vec![funclet_bundle];
 
-        // Set KCFI operand bundle
-        let is_indirect_call = unsafe { llvm::LLVMIsAFunction(llfn).is_none() };
-        let kcfi_bundle =
-            if self.tcx.sess.is_sanitizer_kcfi_enabled() && let Some(fn_abi) = fn_abi && is_indirect_call {
-                let kcfi_typeid = kcfi_typeid_for_fnabi(self.tcx, fn_abi);
-                Some(llvm::OperandBundleDef::new("kcfi", &[self.const_u32(kcfi_typeid)]))
-            } else {
-                None
-            };
-        if kcfi_bundle.is_some() {
-            let kcfi_bundle = kcfi_bundle.as_ref().map(|b| &*b.raw);
-            bundles.push(kcfi_bundle);
-        }
+        // Emit CFI pointer type membership test
+        self.cfi_type_test(fn_attrs, fn_abi, llfn);
+
+        // Emit KCFI operand bundle
+        let kcfi_bundle = self.kcfi_operand_bundle(fn_attrs, fn_abi, llfn);
+        let kcfi_bundle = kcfi_bundle.as_ref().map(|b| &*b.raw);
+        bundles.push(kcfi_bundle);
 
         bundles.retain(|bundle| bundle.is_some());
         let invoke = unsafe {
@@ -841,7 +837,15 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     }
 
     fn intcast(&mut self, val: &'ll Value, dest_ty: &'ll Type, is_signed: bool) -> &'ll Value {
-        unsafe { llvm::LLVMRustBuildIntCast(self.llbuilder, val, dest_ty, is_signed) }
+        unsafe {
+            llvm::LLVMBuildIntCast2(
+                self.llbuilder,
+                val,
+                dest_ty,
+                if is_signed { True } else { False },
+                UNNAMED,
+            )
+        }
     }
 
     fn pointercast(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> &'ll Value {
@@ -981,10 +985,17 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
 
     fn cleanup_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Value) {
         let ty = self.type_struct(&[self.type_i8p(), self.type_i32()], false);
-        let landing_pad = self.landing_pad(ty, pers_fn, 1 /* FIXME should this be 0? */);
+        let landing_pad = self.landing_pad(ty, pers_fn, 0);
         unsafe {
             llvm::LLVMSetCleanup(landing_pad, llvm::True);
         }
+        (self.extract_value(landing_pad, 0), self.extract_value(landing_pad, 1))
+    }
+
+    fn filter_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Value) {
+        let ty = self.type_struct(&[self.type_i8p(), self.type_i32()], false);
+        let landing_pad = self.landing_pad(ty, pers_fn, 1);
+        self.add_clause(landing_pad, self.const_array(self.type_i8p(), &[]));
         (self.extract_value(landing_pad, 0), self.extract_value(landing_pad, 1))
     }
 
@@ -1001,11 +1012,11 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     fn cleanup_pad(&mut self, parent: Option<&'ll Value>, args: &[&'ll Value]) -> Funclet<'ll> {
         let name = cstr!("cleanuppad");
         let ret = unsafe {
-            llvm::LLVMRustBuildCleanupPad(
+            llvm::LLVMBuildCleanupPad(
                 self.llbuilder,
                 parent,
-                args.len() as c_uint,
                 args.as_ptr(),
+                args.len() as c_uint,
                 name.as_ptr(),
             )
         };
@@ -1014,7 +1025,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
 
     fn cleanup_ret(&mut self, funclet: &Funclet<'ll>, unwind: Option<&'ll BasicBlock>) {
         unsafe {
-            llvm::LLVMRustBuildCleanupRet(self.llbuilder, funclet.cleanuppad(), unwind)
+            llvm::LLVMBuildCleanupRet(self.llbuilder, funclet.cleanuppad(), unwind)
                 .expect("LLVM does not have support for cleanupret");
         }
     }
@@ -1022,11 +1033,11 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     fn catch_pad(&mut self, parent: &'ll Value, args: &[&'ll Value]) -> Funclet<'ll> {
         let name = cstr!("catchpad");
         let ret = unsafe {
-            llvm::LLVMRustBuildCatchPad(
+            llvm::LLVMBuildCatchPad(
                 self.llbuilder,
                 parent,
-                args.len() as c_uint,
                 args.as_ptr(),
+                args.len() as c_uint,
                 name.as_ptr(),
             )
         };
@@ -1041,7 +1052,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     ) -> &'ll Value {
         let name = cstr!("catchswitch");
         let ret = unsafe {
-            llvm::LLVMRustBuildCatchSwitch(
+            llvm::LLVMBuildCatchSwitch(
                 self.llbuilder,
                 parent,
                 unwind,
@@ -1052,7 +1063,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         let ret = ret.expect("LLVM does not have support for catchswitch");
         for handler in handlers {
             unsafe {
-                llvm::LLVMRustAddHandler(ret, handler);
+                llvm::LLVMAddHandler(ret, handler);
             }
         }
         ret
@@ -1175,6 +1186,7 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
     fn call(
         &mut self,
         llty: &'ll Type,
+        fn_attrs: Option<&CodegenFnAttrs>,
         fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: &'ll Value,
         args: &[&'ll Value],
@@ -1187,19 +1199,13 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         let funclet_bundle = funclet_bundle.as_ref().map(|b| &*b.raw);
         let mut bundles = vec![funclet_bundle];
 
-        // Set KCFI operand bundle
-        let is_indirect_call = unsafe { llvm::LLVMIsAFunction(llfn).is_none() };
-        let kcfi_bundle =
-            if let Some(fn_abi) = fn_abi && self.tcx.sess.is_sanitizer_kcfi_enabled() && is_indirect_call {
-                let kcfi_typeid = kcfi_typeid_for_fnabi(self.tcx, fn_abi);
-                Some(llvm::OperandBundleDef::new("kcfi", &[self.const_u32(kcfi_typeid)]))
-            } else {
-                None
-            };
-        if kcfi_bundle.is_some() {
-            let kcfi_bundle = kcfi_bundle.as_ref().map(|b| &*b.raw);
-            bundles.push(kcfi_bundle);
-        }
+        // Emit CFI pointer type membership test
+        self.cfi_type_test(fn_attrs, fn_abi, llfn);
+
+        // Emit KCFI operand bundle
+        let kcfi_bundle = self.kcfi_operand_bundle(fn_attrs, fn_abi, llfn);
+        let kcfi_bundle = kcfi_bundle.as_ref().map(|b| &*b.raw);
+        bundles.push(kcfi_bundle);
 
         bundles.retain(|bundle| bundle.is_some());
         let call = unsafe {
@@ -1376,8 +1382,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
     }
 
     pub fn catch_ret(&mut self, funclet: &Funclet<'ll>, unwind: &'ll BasicBlock) -> &'ll Value {
-        let ret =
-            unsafe { llvm::LLVMRustBuildCatchRet(self.llbuilder, funclet.cleanuppad(), unwind) };
+        let ret = unsafe { llvm::LLVMBuildCatchRet(self.llbuilder, funclet.cleanuppad(), unwind) };
         ret.expect("LLVM does not have support for catchret")
     }
 
@@ -1449,7 +1454,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
 
     pub(crate) fn call_intrinsic(&mut self, intrinsic: &str, args: &[&'ll Value]) -> &'ll Value {
         let (ty, f) = self.cx.get_intrinsic(intrinsic);
-        self.call(ty, None, f, args, None)
+        self.call(ty, None, None, f, args, None)
     }
 
     fn call_lifetime_intrinsic(&mut self, intrinsic: &str, ptr: &'ll Value, size: Size) {
@@ -1511,7 +1516,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
             format!("llvm.{}.sat.i{}.f{}", instr, int_width, float_width)
         };
         let f = self.declare_cfn(&name, llvm::UnnamedAddr::No, self.type_func(&[src_ty], dest_ty));
-        self.call(self.type_func(&[src_ty], dest_ty), None, f, &[val], None)
+        self.call(self.type_func(&[src_ty], dest_ty), None, None, f, &[val], None)
     }
 
     pub(crate) fn landing_pad(
@@ -1527,5 +1532,72 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         unsafe {
             llvm::LLVMBuildLandingPad(self.llbuilder, ty, None, num_clauses as c_uint, UNNAMED)
         }
+    }
+
+    // Emits CFI pointer type membership tests.
+    fn cfi_type_test(
+        &mut self,
+        fn_attrs: Option<&CodegenFnAttrs>,
+        fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
+        llfn: &'ll Value,
+    ) {
+        let is_indirect_call = unsafe { llvm::LLVMIsAFunction(llfn).is_none() };
+        if is_indirect_call && fn_abi.is_some() && self.tcx.sess.is_sanitizer_cfi_enabled() {
+            if fn_attrs.is_some() && fn_attrs.unwrap().no_sanitize.contains(SanitizerSet::CFI) {
+                return;
+            }
+
+            let mut options = TypeIdOptions::empty();
+            if self.tcx.sess.is_sanitizer_cfi_generalize_pointers_enabled() {
+                options.insert(TypeIdOptions::GENERALIZE_POINTERS);
+            }
+            if self.tcx.sess.is_sanitizer_cfi_normalize_integers_enabled() {
+                options.insert(TypeIdOptions::NORMALIZE_INTEGERS);
+            }
+
+            let typeid = typeid_for_fnabi(self.tcx, fn_abi.unwrap(), options);
+            let typeid_metadata = self.cx.typeid_metadata(typeid).unwrap();
+
+            // Test whether the function pointer is associated with the type identifier.
+            let cond = self.type_test(llfn, typeid_metadata);
+            let bb_pass = self.append_sibling_block("type_test.pass");
+            let bb_fail = self.append_sibling_block("type_test.fail");
+            self.cond_br(cond, bb_pass, bb_fail);
+
+            self.switch_to_block(bb_fail);
+            self.abort();
+            self.unreachable();
+
+            self.switch_to_block(bb_pass);
+        }
+    }
+
+    // Emits KCFI operand bundles.
+    fn kcfi_operand_bundle(
+        &mut self,
+        fn_attrs: Option<&CodegenFnAttrs>,
+        fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
+        llfn: &'ll Value,
+    ) -> Option<llvm::OperandBundleDef<'ll>> {
+        let is_indirect_call = unsafe { llvm::LLVMIsAFunction(llfn).is_none() };
+        let kcfi_bundle = if is_indirect_call && self.tcx.sess.is_sanitizer_kcfi_enabled() {
+            if fn_attrs.is_some() && fn_attrs.unwrap().no_sanitize.contains(SanitizerSet::KCFI) {
+                return None;
+            }
+
+            let mut options = TypeIdOptions::empty();
+            if self.tcx.sess.is_sanitizer_cfi_generalize_pointers_enabled() {
+                options.insert(TypeIdOptions::GENERALIZE_POINTERS);
+            }
+            if self.tcx.sess.is_sanitizer_cfi_normalize_integers_enabled() {
+                options.insert(TypeIdOptions::NORMALIZE_INTEGERS);
+            }
+
+            let kcfi_typeid = kcfi_typeid_for_fnabi(self.tcx, fn_abi.unwrap(), options);
+            Some(llvm::OperandBundleDef::new("kcfi", &[self.const_u32(kcfi_typeid)]))
+        } else {
+            None
+        };
+        kcfi_bundle
     }
 }

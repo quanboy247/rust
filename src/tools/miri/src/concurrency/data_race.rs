@@ -48,7 +48,7 @@ use std::{
 
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir;
 use rustc_span::Span;
 use rustc_target::abi::{Align, Size};
@@ -1199,7 +1199,7 @@ pub struct GlobalState {
 
     /// A flag to mark we are currently performing
     /// a data race free action (such as atomic access)
-    /// to supress the race detector
+    /// to suppress the race detector
     ongoing_action_data_race_free: Cell<bool>,
 
     /// Mapping of a vector index to a known set of thread

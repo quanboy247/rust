@@ -1,6 +1,6 @@
 //! See docs in `build/expr/mod.rs`.
 
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::ty::util::IntTypeExt;
 use rustc_target::abi::{Abi, FieldIdx, Primitive};
 
@@ -171,7 +171,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         args: vec![Operand::Move(size), Operand::Move(align)],
                         destination: storage,
                         target: Some(success),
-                        cleanup: None,
+                        unwind: UnwindAction::Continue,
                         from_hir_call: false,
                         fn_span: expr_span,
                     },
@@ -481,6 +481,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }))))
             }
 
+            ExprKind::OffsetOf { container, fields } => {
+                block.and(Rvalue::NullaryOp(NullOp::OffsetOf(fields), container))
+            }
+
             ExprKind::Literal { .. }
             | ExprKind::NamedConst { .. }
             | ExprKind::NonHirLiteral { .. }
@@ -702,7 +706,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 this.cfg.terminate(
                     block,
                     outer_source_info,
-                    TerminatorKind::Drop { place: to_drop, target: success, unwind: None },
+                    TerminatorKind::Drop {
+                        place: to_drop,
+                        target: success,
+                        unwind: UnwindAction::Continue,
+                    },
                 );
                 this.diverge_from(block);
                 block = success;

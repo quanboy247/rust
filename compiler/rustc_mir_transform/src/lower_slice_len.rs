@@ -3,7 +3,7 @@
 
 use crate::MirPass;
 use rustc_hir::def_id::DefId;
-use rustc_index::vec::IndexSlice;
+use rustc_index::IndexSlice;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
 
@@ -54,7 +54,6 @@ fn lower_slice_len_call<'tcx>(
             args,
             destination,
             target: Some(bb),
-            cleanup: None,
             from_hir_call: true,
             ..
         } => {

@@ -19,13 +19,14 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fmt::Display;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::str;
 
-use build_helper::ci::CiEnv;
+use build_helper::ci::{gha, CiEnv};
 use channel::GitInfo;
 use config::{DryRun, Target};
 use filetime::FileTime;
@@ -58,6 +59,7 @@ mod render_tests;
 mod run;
 mod sanity;
 mod setup;
+mod suggest;
 mod tarball;
 mod test;
 mod tool;
@@ -149,8 +151,6 @@ const EXTRA_CHECK_CFGS: &[(Option<Mode>, &'static str, Option<&[&'static str]>)]
     // Needed to avoid the need to copy windows.lib into the sysroot.
     (Some(Mode::Rustc), "windows_raw_dylib", None),
     (Some(Mode::ToolRustc), "windows_raw_dylib", None),
-    // #[cfg(bootstrap)] ohos
-    (Some(Mode::Std), "target_env", Some(&["ohos"])),
 ];
 
 /// A structure representing a Rust compiler.
@@ -189,6 +189,7 @@ pub enum GitRepo {
 /// although most functions are implemented as free functions rather than
 /// methods specifically on this structure itself (to make it easier to
 /// organize).
+#[cfg_attr(not(feature = "build-metrics"), derive(Clone))]
 pub struct Build {
     /// User-specified configuration from `config.toml`.
     config: Config,
@@ -235,18 +236,17 @@ pub struct Build {
     ci_env: CiEnv,
     delayed_failures: RefCell<Vec<String>>,
     prerelease_version: Cell<Option<u32>>,
-    tool_artifacts:
-        RefCell<HashMap<TargetSelection, HashMap<String, (&'static str, PathBuf, Vec<String>)>>>,
 
     #[cfg(feature = "build-metrics")]
     metrics: metrics::BuildMetrics,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Crate {
     name: Interned<String>,
     deps: HashSet<Interned<String>>,
     path: PathBuf,
+    has_lib: bool,
 }
 
 impl Crate {
@@ -358,14 +358,14 @@ impl Build {
         #[cfg(not(unix))]
         let is_sudo = false;
 
-        let ignore_git = config.ignore_git;
-        let rust_info = channel::GitInfo::new(ignore_git, &src);
-        let cargo_info = channel::GitInfo::new(ignore_git, &src.join("src/tools/cargo"));
+        let omit_git_hash = config.omit_git_hash;
+        let rust_info = channel::GitInfo::new(omit_git_hash, &src);
+        let cargo_info = channel::GitInfo::new(omit_git_hash, &src.join("src/tools/cargo"));
         let rust_analyzer_info =
-            channel::GitInfo::new(ignore_git, &src.join("src/tools/rust-analyzer"));
-        let clippy_info = channel::GitInfo::new(ignore_git, &src.join("src/tools/clippy"));
-        let miri_info = channel::GitInfo::new(ignore_git, &src.join("src/tools/miri"));
-        let rustfmt_info = channel::GitInfo::new(ignore_git, &src.join("src/tools/rustfmt"));
+            channel::GitInfo::new(omit_git_hash, &src.join("src/tools/rust-analyzer"));
+        let clippy_info = channel::GitInfo::new(omit_git_hash, &src.join("src/tools/clippy"));
+        let miri_info = channel::GitInfo::new(omit_git_hash, &src.join("src/tools/miri"));
+        let rustfmt_info = channel::GitInfo::new(omit_git_hash, &src.join("src/tools/rustfmt"));
 
         // we always try to use git for LLVM builds
         let in_tree_llvm_info = channel::GitInfo::new(false, &src.join("src/llvm-project"));
@@ -455,7 +455,6 @@ impl Build {
             ci_env: CiEnv::current(),
             delayed_failures: RefCell::new(Vec::new()),
             prerelease_version: Cell::new(None),
-            tool_artifacts: Default::default(),
 
             #[cfg(feature = "build-metrics")]
             metrics: metrics::BuildMetrics::init(),
@@ -656,12 +655,19 @@ impl Build {
             job::setup(self);
         }
 
-        if let Subcommand::Format { check, paths } = &self.config.cmd {
-            return format::format(&builder::Builder::new(&self), *check, &paths);
-        }
-
         // Download rustfmt early so that it can be used in rust-analyzer configs.
         let _ = &builder::Builder::new(&self).initial_rustfmt();
+
+        // hardcoded subcommands
+        match &self.config.cmd {
+            Subcommand::Format { check } => {
+                return format::format(&builder::Builder::new(&self), *check, &self.config.paths);
+            }
+            Subcommand::Suggest { run } => {
+                return suggest::suggest(&builder::Builder::new(&self), *run);
+            }
+            _ => (),
+        }
 
         {
             let builder = builder::Builder::new(&self);
@@ -802,6 +808,11 @@ impl Build {
     /// standard library, and targeting the specified architecture.
     fn cargo_out(&self, compiler: Compiler, mode: Mode, target: TargetSelection) -> PathBuf {
         self.stage_out(compiler, mode).join(&*target.triple).join(self.cargo_dir())
+    }
+
+    /// Directory where the extracted `rustc-dev` component is stored.
+    fn ci_rustc_dir(&self, target: TargetSelection) -> PathBuf {
+        self.out.join(&*target.triple).join("ci-rustc")
     }
 
     /// Root output directory for LLVM compiled for `target`
@@ -978,6 +989,85 @@ impl Build {
             DryRun::Disabled | DryRun::UserSelected => {
                 println!("{}", msg);
             }
+        }
+    }
+
+    fn msg_check(
+        &self,
+        what: impl Display,
+        target: impl Into<Option<TargetSelection>>,
+    ) -> Option<gha::Group> {
+        self.msg(Kind::Check, self.config.stage, what, self.config.build, target)
+    }
+
+    fn msg_build(
+        &self,
+        compiler: Compiler,
+        what: impl Display,
+        target: impl Into<Option<TargetSelection>>,
+    ) -> Option<gha::Group> {
+        self.msg(Kind::Build, compiler.stage, what, compiler.host, target)
+    }
+
+    /// Return a `Group` guard for a [`Step`] that is built for each `--stage`.
+    fn msg(
+        &self,
+        action: impl Into<Kind>,
+        stage: u32,
+        what: impl Display,
+        host: impl Into<Option<TargetSelection>>,
+        target: impl Into<Option<TargetSelection>>,
+    ) -> Option<gha::Group> {
+        let action = action.into();
+        let msg = |fmt| format!("{action:?}ing stage{stage} {what}{fmt}");
+        let msg = if let Some(target) = target.into() {
+            let host = host.into().unwrap();
+            if host == target {
+                msg(format_args!(" ({target})"))
+            } else {
+                msg(format_args!(" ({host} -> {target})"))
+            }
+        } else {
+            msg(format_args!(""))
+        };
+        self.group(&msg)
+    }
+
+    /// Return a `Group` guard for a [`Step`] that is only built once and isn't affected by `--stage`.
+    fn msg_unstaged(
+        &self,
+        action: impl Into<Kind>,
+        what: impl Display,
+        target: TargetSelection,
+    ) -> Option<gha::Group> {
+        let action = action.into();
+        let msg = format!("{action:?}ing {what} for {target}");
+        self.group(&msg)
+    }
+
+    fn msg_sysroot_tool(
+        &self,
+        action: impl Into<Kind>,
+        stage: u32,
+        what: impl Display,
+        host: TargetSelection,
+        target: TargetSelection,
+    ) -> Option<gha::Group> {
+        let action = action.into();
+        let msg = |fmt| format!("{action:?}ing {what} {fmt}");
+        let msg = if host == target {
+            msg(format_args!("(stage{stage} -> stage{}, {target})", stage + 1))
+        } else {
+            msg(format_args!("(stage{stage}:{host} -> stage{}:{target})", stage + 1))
+        };
+        self.group(&msg)
+    }
+
+    fn group(&self, msg: &str) -> Option<gha::Group> {
+        self.info(&msg);
+        match self.config.dry_run {
+            DryRun::SelfCheck => None,
+            DryRun::Disabled | DryRun::UserSelected => Some(gha::group(&msg)),
         }
     }
 
@@ -1233,7 +1323,7 @@ impl Build {
         match &self.config.channel[..] {
             "stable" => num.to_string(),
             "beta" => {
-                if self.rust_info().is_managed_git_subrepository() && !self.config.ignore_git {
+                if self.rust_info().is_managed_git_subrepository() && !self.config.omit_git_hash {
                     format!("{}-beta.{}", num, self.beta_prerelease_version())
                 } else {
                     format!("{}-beta", num)

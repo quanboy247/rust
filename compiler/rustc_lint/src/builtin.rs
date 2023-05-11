@@ -22,7 +22,7 @@
 
 use crate::fluent_generated as fluent;
 use crate::{
-    errors::BuiltinEllpisisInclusiveRangePatterns,
+    errors::BuiltinEllipsisInclusiveRangePatterns,
     lints::{
         BuiltinAnonymousParams, BuiltinBoxPointers, BuiltinClashingExtern,
         BuiltinClashingExternSub, BuiltinConstNoMangle, BuiltinDeprecatedAttrLink,
@@ -62,7 +62,9 @@ use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty::layout::{LayoutError, LayoutOf};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::subst::GenericArgKind;
+use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt, VariantDef};
+use rustc_session::config::ExpectedValues;
 use rustc_session::lint::{BuiltinLintDiagnostics, FutureIncompatibilityReason};
 use rustc_span::edition::Edition;
 use rustc_span::source_map::Spanned;
@@ -116,8 +118,7 @@ impl EarlyLintPass for WhileTrue {
     #[inline]
     fn check_expr(&mut self, cx: &EarlyContext<'_>, e: &ast::Expr) {
         if let ast::ExprKind::While(cond, _, label) = &e.kind
-            && let cond = pierce_parens(cond)
-            && let ast::ExprKind::Lit(token_lit) = cond.kind
+            && let ast::ExprKind::Lit(token_lit) = pierce_parens(cond).kind
             && let token::Lit { kind: token::Bool, symbol: kw::True, .. } = token_lit
             && !cond.span.from_expansion()
         {
@@ -166,10 +167,8 @@ declare_lint_pass!(BoxPointers => [BOX_POINTERS]);
 impl BoxPointers {
     fn check_heap_type(&self, cx: &LateContext<'_>, span: Span, ty: Ty<'_>) {
         for leaf in ty.walk() {
-            if let GenericArgKind::Type(leaf_ty) = leaf.unpack() {
-                if leaf_ty.is_box() {
-                    cx.emit_spanned_lint(BOX_POINTERS, span, BuiltinBoxPointers { ty });
-                }
+            if let GenericArgKind::Type(leaf_ty) = leaf.unpack() && leaf_ty.is_box() {
+                cx.emit_spanned_lint(BOX_POINTERS, span, BuiltinBoxPointers { ty });
             }
         }
     }
@@ -548,32 +547,13 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
     }
 
     fn check_item(&mut self, cx: &LateContext<'_>, it: &hir::Item<'_>) {
-        match it.kind {
-            hir::ItemKind::Trait(..) => {
-                // Issue #11592: traits are always considered exported, even when private.
-                if cx.tcx.visibility(it.owner_id)
-                    == ty::Visibility::Restricted(
-                        cx.tcx.parent_module_from_def_id(it.owner_id.def_id).to_def_id(),
-                    )
-                {
-                    return;
-                }
-            }
-            hir::ItemKind::TyAlias(..)
-            | hir::ItemKind::Fn(..)
-            | hir::ItemKind::Macro(..)
-            | hir::ItemKind::Mod(..)
-            | hir::ItemKind::Enum(..)
-            | hir::ItemKind::Struct(..)
-            | hir::ItemKind::Union(..)
-            | hir::ItemKind::Const(..)
-            | hir::ItemKind::Static(..) => {}
-
-            _ => return,
-        };
+        // Previously the Impl and Use types have been excluded from missing docs,
+        // so we will continue to exclude them for compatibility
+        if let hir::ItemKind::Impl(..) | hir::ItemKind::Use(..) = it.kind {
+            return;
+        }
 
         let (article, desc) = cx.tcx.article_and_description(it.owner_id.to_def_id());
-
         self.check_missing_docs_attrs(cx, it.owner_id.def_id, article, desc);
     }
 
@@ -1463,6 +1443,10 @@ impl<'tcx> LateLintPass<'tcx> for TypeAliasBounds {
             // Bounds are respected for `type X = impl Trait`
             return;
         }
+        if cx.tcx.type_of(item.owner_id).skip_binder().has_inherent_projections() {
+            // Bounds are respected for `type X = … Type::Inherent …`
+            return;
+        }
         // There must not be a where clause
         if type_alias_generics.predicates.is_empty() {
             return;
@@ -1582,7 +1566,6 @@ declare_lint_pass!(
 
 impl<'tcx> LateLintPass<'tcx> for TrivialConstraints {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item<'tcx>) {
-        use rustc_middle::ty::visit::TypeVisitableExt;
         use rustc_middle::ty::Clause;
         use rustc_middle::ty::PredicateKind::*;
 
@@ -1711,13 +1694,13 @@ impl EarlyLintPass for EllipsisInclusiveRangePatterns {
             }
         }
 
-        let (parenthesise, endpoints) = match &pat.kind {
+        let (parentheses, endpoints) = match &pat.kind {
             PatKind::Ref(subpat, _) => (true, matches_ellipsis_pat(&subpat)),
             _ => (false, matches_ellipsis_pat(pat)),
         };
 
         if let Some((start, end, join)) = endpoints {
-            if parenthesise {
+            if parentheses {
                 self.node_id = Some(pat.id);
                 let end = expr_to_string(&end);
                 let replace = match start {
@@ -1725,7 +1708,7 @@ impl EarlyLintPass for EllipsisInclusiveRangePatterns {
                     None => format!("&(..={})", end),
                 };
                 if join.edition() >= Edition::Edition2021 {
-                    cx.sess().emit_err(BuiltinEllpisisInclusiveRangePatterns {
+                    cx.sess().emit_err(BuiltinEllipsisInclusiveRangePatterns {
                         span: pat.span,
                         suggestion: pat.span,
                         replace,
@@ -1743,7 +1726,7 @@ impl EarlyLintPass for EllipsisInclusiveRangePatterns {
             } else {
                 let replace = "..=";
                 if join.edition() >= Edition::Edition2021 {
-                    cx.sess().emit_err(BuiltinEllpisisInclusiveRangePatterns {
+                    cx.sess().emit_err(BuiltinEllipsisInclusiveRangePatterns {
                         span: pat.span,
                         suggestion: join,
                         replace: replace.to_string(),
@@ -1947,7 +1930,7 @@ impl KeywordIdents {
         };
 
         // Don't lint `r#foo`.
-        if cx.sess().parse_sess.raw_identifier_spans.borrow().contains(&ident.span) {
+        if cx.sess().parse_sess.raw_identifier_spans.contains(ident.span) {
             return;
         }
 
@@ -2560,7 +2543,7 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
                             .subst(cx.tcx, substs)
                             .apply_any_module(cx.tcx, cx.param_env)
                         {
-                            // Entirely skip uninhbaited variants.
+                            // Entirely skip uninhabited variants.
                             Some(false) => return None,
                             // Forward the others, but remember which ones are definitely inhabited.
                             Some(true) => true,
@@ -2628,7 +2611,7 @@ impl<'tcx> LateLintPass<'tcx> for InvalidValue {
             if let Some(err) = with_no_trimmed_paths!(ty_find_init_error(cx, conjured_ty, init)) {
                 let msg = match init {
                     InitKind::Zeroed => fluent::lint_builtin_unpermitted_type_init_zeroed,
-                    InitKind::Uninit => fluent::lint_builtin_unpermitted_type_init_unint,
+                    InitKind::Uninit => fluent::lint_builtin_unpermitted_type_init_uninit,
                 };
                 let sub = BuiltinUnpermittedTypeInitSub { err };
                 cx.emit_spanned_lint(
@@ -2919,6 +2902,7 @@ impl ClashingExternDeclarations {
                         | (Generator(..), Generator(..))
                         | (GeneratorWitness(..), GeneratorWitness(..))
                         | (Alias(ty::Projection, ..), Alias(ty::Projection, ..))
+                        | (Alias(ty::Inherent, ..), Alias(ty::Inherent, ..))
                         | (Alias(ty::Opaque, ..), Alias(ty::Opaque, ..)) => false,
 
                         // These definitely should have been caught above.
@@ -3308,16 +3292,15 @@ impl EarlyLintPass for UnexpectedCfgs {
         let cfg = &cx.sess().parse_sess.config;
         let check_cfg = &cx.sess().parse_sess.check_config;
         for &(name, value) in cfg {
-            if let Some(names_valid) = &check_cfg.names_valid && !names_valid.contains(&name){
-                cx.emit_lint(UNEXPECTED_CFGS, BuiltinUnexpectedCliConfigName {
-                    name,
-                });
-            }
-            if let Some(value) = value && let Some(values) = check_cfg.values_valid.get(&name) && !values.contains(&value) {
-                cx.emit_lint(
-                    UNEXPECTED_CFGS,
-                    BuiltinUnexpectedCliConfigValue { name, value },
-                );
+            match check_cfg.expecteds.get(&name) {
+                Some(ExpectedValues::Some(values)) if !values.contains(&value) => {
+                    let value = value.unwrap_or(kw::Empty);
+                    cx.emit_lint(UNEXPECTED_CFGS, BuiltinUnexpectedCliConfigValue { name, value });
+                }
+                None if check_cfg.exhaustive_names => {
+                    cx.emit_lint(UNEXPECTED_CFGS, BuiltinUnexpectedCliConfigName { name });
+                }
+                _ => { /* expected */ }
             }
         }
     }

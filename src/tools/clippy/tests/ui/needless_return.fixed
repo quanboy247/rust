@@ -1,4 +1,4 @@
-// run-rustfix
+//@run-rustfix
 
 #![feature(lint_reasons)]
 #![feature(yeet_expr)]
@@ -305,6 +305,15 @@ mod issue10049 {
     fn multiple(b1: bool, b2: bool, b3: bool) -> u32 {
         (if b1 { 0 } else { 1 } | if b2 { 2 } else { 3 } | if b3 { 4 } else { 5 })
     }
+}
+
+fn test_match_as_stmt() {
+    let x = 9;
+    match x {
+        1 => 2,
+        2 => return,
+        _ => 0,
+    };
 }
 
 fn main() {}

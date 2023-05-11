@@ -7,7 +7,7 @@ use rustc_middle::ty::InternalSubsts;
 use rustc_middle::ty::{self, EarlyBinder, GeneratorSubsts, Ty, TyCtxt};
 use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
 
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 
 use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
@@ -95,7 +95,7 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
             &add_moves_for_packed_drops::AddMovesForPackedDrops,
             &deref_separator::Derefer,
             &remove_noop_landing_pads::RemoveNoopLandingPads,
-            &simplify::SimplifyCfg::new("make_shim"),
+            &simplify::SimplifyCfg::MakeShim,
             &add_call_guards::CriticalCallEdges,
             &abort_unwinding_calls::AbortUnwindingCalls,
         ],
@@ -355,7 +355,7 @@ fn build_thread_local_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'t
 fn build_clone_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, self_ty: Ty<'tcx>) -> Body<'tcx> {
     debug!("build_clone_shim(def_id={:?})", def_id);
 
-    let param_env = tcx.param_env(def_id);
+    let param_env = tcx.param_env_reveal_all_normalized(def_id);
 
     let mut builder = CloneShimBuilder::new(tcx, def_id, self_ty);
     let is_copy = self_ty.is_copy_modulo_regions(tcx, param_env);
@@ -499,7 +499,7 @@ impl<'tcx> CloneShimBuilder<'tcx> {
                 args: vec![Operand::Move(ref_loc)],
                 destination: dest,
                 target: Some(next),
-                cleanup: Some(cleanup),
+                unwind: UnwindAction::Cleanup(cleanup),
                 from_hir_call: true,
                 fn_span: self.span,
             },
@@ -540,7 +540,11 @@ impl<'tcx> CloneShimBuilder<'tcx> {
             self.make_clone_call(dest_field, src_field, ity, next_block, unwind);
             self.block(
                 vec![],
-                TerminatorKind::Drop { place: dest_field, target: unwind, unwind: None },
+                TerminatorKind::Drop {
+                    place: dest_field,
+                    target: unwind,
+                    unwind: UnwindAction::Terminate,
+                },
                 true,
             );
             unwind = next_unwind;
@@ -776,10 +780,10 @@ fn build_call_shim<'tcx>(
             args,
             destination: Place::return_place(),
             target: Some(BasicBlock::new(1)),
-            cleanup: if let Some(Adjustment::RefMut) = rcvr_adjustment {
-                Some(BasicBlock::new(3))
+            unwind: if let Some(Adjustment::RefMut) = rcvr_adjustment {
+                UnwindAction::Cleanup(BasicBlock::new(3))
             } else {
-                None
+                UnwindAction::Continue
             },
             from_hir_call: true,
             fn_span: span,
@@ -792,7 +796,11 @@ fn build_call_shim<'tcx>(
         block(
             &mut blocks,
             vec![],
-            TerminatorKind::Drop { place: rcvr_place(), target: BasicBlock::new(2), unwind: None },
+            TerminatorKind::Drop {
+                place: rcvr_place(),
+                target: BasicBlock::new(2),
+                unwind: UnwindAction::Continue,
+            },
             false,
         );
     }
@@ -803,7 +811,11 @@ fn build_call_shim<'tcx>(
         block(
             &mut blocks,
             vec![],
-            TerminatorKind::Drop { place: rcvr_place(), target: BasicBlock::new(4), unwind: None },
+            TerminatorKind::Drop {
+                place: rcvr_place(),
+                target: BasicBlock::new(4),
+                unwind: UnwindAction::Terminate,
+            },
             true,
         );
 
@@ -824,7 +836,7 @@ fn build_call_shim<'tcx>(
 pub fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
     debug_assert!(tcx.is_constructor(ctor_id));
 
-    let param_env = tcx.param_env(ctor_id);
+    let param_env = tcx.param_env_reveal_all_normalized(ctor_id);
 
     // Normalize the sig.
     let sig = tcx

@@ -112,7 +112,7 @@ pub fn separate_const_switch(body: &mut Body<'_>) -> usize {
                         | TerminatorKind::Assert { .. }
                         | TerminatorKind::FalseUnwind { .. }
                         | TerminatorKind::Yield { .. }
-                        | TerminatorKind::Abort
+                        | TerminatorKind::Terminate
                         | TerminatorKind::Return
                         | TerminatorKind::Unreachable
                         | TerminatorKind::InlineAsm { .. }
@@ -164,7 +164,7 @@ pub fn separate_const_switch(body: &mut Body<'_>) -> usize {
             }
 
             TerminatorKind::Resume
-            | TerminatorKind::Abort
+            | TerminatorKind::Terminate
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
             | TerminatorKind::GeneratorDrop
@@ -303,8 +303,7 @@ fn find_determining_place<'tcx>(
                     | Rvalue::NullaryOp(_, _)
                     | Rvalue::ShallowInitBox(_, _)
                     | Rvalue::UnaryOp(_, Operand::Constant(_))
-                    | Rvalue::Cast(_, Operand::Constant(_), _)
-                    => return None,
+                    | Rvalue::Cast(_, Operand::Constant(_), _) => return None,
                 }
             }
 

@@ -11,6 +11,7 @@ allow-unauthenticated = [
     "S-*",
     "T-*",
     "WG-*",
+    "beta-nominated",
     "const-hack",
     "llvm-main",
     "needs-fcp",
@@ -186,13 +187,17 @@ trigger_files = [
     "configure",
     "Cargo.toml",
     "config.example.toml",
-    "src/stage0.json"
+    "src/stage0.json",
+    "src/tools/compiletest",
+    "src/tools/tidy",
 ]
 
 [autolabel."T-infra"]
 trigger_files = [
     "src/ci",
     "src/tools/bump-stage0",
+    "src/tools/cargotest",
+    "src/tools/tier-check",
 ]
 
 [autolabel."T-style"]
@@ -340,11 +345,11 @@ message = "Some changes occurred in `const_evaluatable.rs`"
 cc = ["@BoxyUwU"]
 
 [mentions."compiler/rustc_middle/src/ty/abstract_const.rs"]
-message = "Some changes occured in `abstract_const.rs`"
+message = "Some changes occurred in `abstract_const.rs`"
 cc = ["@BoxyUwU"]
 
 [mentions."compiler/rustc_ty_utils/src/consts.rs"]
-message = "Some changes occured in `rustc_ty_utils::consts.rs`"
+message = "Some changes occurred in `rustc_ty_utils::consts.rs`"
 cc = ["@BoxyUwU"]
 
 [mentions."compiler/rustc_trait_selection/src/solve/"]
@@ -361,6 +366,10 @@ cc = ["@lcnr", "@compiler-errors"]
 [mentions."compiler/rustc_error_codes/src/error_codes.rs"]
 message = "Some changes occurred in diagnostic error codes"
 cc = ["@GuillaumeGomez"]
+
+[mentions."compiler/rustc_mir_build/src/thir/pattern"]
+message = "Some changes might have occurred in exhaustiveness checking"
+cc = ["@Nadrieril"]
 
 [mentions."library"]
 message = """
@@ -466,10 +475,10 @@ cc = ["@rust-lang/style"]
 
 [mentions."Cargo.lock"]
 message = """
-These commits modify the `Cargo.lock` file. Random changes to `Cargo.lock` can be introduced when switching branches and rebasing PRs. 
-This was probably unintentional and should be reverted before this PR is merged. 
+These commits modify the `Cargo.lock` file. Unintentional changes to `Cargo.lock` can be introduced when switching branches and rebasing PRs.
 
-If this was intentional then you can ignore this comment.
+If this was unintentional then you should revert the changes before this PR is merged.
+Otherwise, you can ignore this comment.
 """
 
 [mentions."src/tools/x"]
@@ -479,6 +488,14 @@ message = "`src/tools/x` was changed. Bump version of Cargo.toml in `src/tools/x
 message = "This PR changes src/bootstrap/defaults/config.compiler.toml. If appropriate, please also update `config.codegen.toml` so the defaults are in sync."
 [mentions."src/bootstrap/defaults/config.codegen.toml"]
 message = "This PR changes src/bootstrap/defaults/config.codegen.toml. If appropriate, please also update `config.compiler.toml` so the defaults are in sync."
+
+[mentions."tests/ui/deriving/deriving-all-codegen.stdout"]
+message = "Changes to the code generated for builtin derived traits."
+cc = ["@nnethercote"]
+
+[mentions."tests/ui/stats/hir-stats.stderr"]
+message = "Changes to the size of AST and/or HIR nodes."
+cc = ["@nnethercote"]
 
 [assign]
 warn_non_default_branch = true
@@ -495,7 +512,6 @@ compiler-team = [
 ]
 compiler-team-contributors = [
     "@compiler-errors",
-    "@eholk",
     "@jackh726",
     "@TaKO8Ki",
     "@WaffleLapkin",

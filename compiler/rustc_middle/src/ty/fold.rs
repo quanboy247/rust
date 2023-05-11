@@ -37,7 +37,8 @@ where
     }
 
     fn fold_region(&mut self, r: ty::Region<'tcx>) -> ty::Region<'tcx> {
-        let r = r.super_fold_with(self);
+        // This one is a little different, because `super_fold_with` is not
+        // implemented on non-recursive `Region`.
         (self.lt_op)(r)
     }
 
@@ -379,9 +380,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 let index = entry.index();
                 let var = ty::BoundVar::from_usize(index);
                 let kind = entry
-                    .or_insert_with(|| {
-                        ty::BoundVariableKind::Region(ty::BrAnon(index as u32, None))
-                    })
+                    .or_insert_with(|| ty::BoundVariableKind::Region(ty::BrAnon(None)))
                     .expect_region();
                 let br = ty::BoundRegion { var, kind };
                 self.tcx.mk_re_late_bound(ty::INNERMOST, br)
@@ -391,9 +390,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 let index = entry.index();
                 let var = ty::BoundVar::from_usize(index);
                 let kind = entry
-                    .or_insert_with(|| {
-                        ty::BoundVariableKind::Ty(ty::BoundTyKind::Anon(index as u32))
-                    })
+                    .or_insert_with(|| ty::BoundVariableKind::Ty(ty::BoundTyKind::Anon))
                     .expect_ty();
                 self.tcx.mk_bound(ty::INNERMOST, BoundTy { var, kind })
             }

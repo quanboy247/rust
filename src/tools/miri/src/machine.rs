@@ -32,8 +32,14 @@ use crate::{
     *,
 };
 
-/// The number of the available real-time signal with the lowest priority.
-/// Dummy constant related to epoll, must be between 32 and 64.
+/// First real-time signal.
+/// `signal(7)` says this must be between 32 and 64 and specifies 34 or 35
+/// as typical values.
+pub const SIGRTMIN: i32 = 34;
+
+/// Last real-time signal.
+/// `signal(7)` says it must be between 32 and 64 and specifies
+/// `SIGRTMAX` - `SIGRTMIN` >= 8 (which is the value of `_POSIX_RTSIG_MAX`)
 pub const SIGRTMAX: i32 = 42;
 
 /// Extra data stored with each stack frame
@@ -253,20 +259,25 @@ impl ProvenanceExtra {
 
 /// Extra per-allocation data
 #[derive(Debug, Clone)]
-pub struct AllocExtra {
+pub struct AllocExtra<'tcx> {
     /// Global state of the borrow tracker, if enabled.
     pub borrow_tracker: Option<borrow_tracker::AllocState>,
-    /// Data race detection via the use of a vector-clock,
-    ///  this is only added if it is enabled.
+    /// Data race detection via the use of a vector-clock.
+    /// This is only added if it is enabled.
     pub data_race: Option<data_race::AllocState>,
-    /// Weak memory emulation via the use of store buffers,
-    ///  this is only added if it is enabled.
+    /// Weak memory emulation via the use of store buffers.
+    /// This is only added if it is enabled.
     pub weak_memory: Option<weak_memory::AllocState>,
+    /// A backtrace to where this allocation was allocated.
+    /// As this is recorded for leak reports, it only exists
+    /// if this allocation is leakable. The backtrace is not
+    /// pruned yet; that should be done before printing it.
+    pub backtrace: Option<Vec<FrameInfo<'tcx>>>,
 }
 
-impl VisitTags for AllocExtra {
+impl VisitTags for AllocExtra<'_> {
     fn visit_tags(&self, visit: &mut dyn FnMut(BorTag)) {
-        let AllocExtra { borrow_tracker, data_race, weak_memory } = self;
+        let AllocExtra { borrow_tracker, data_race, weak_memory, backtrace: _ } = self;
 
         borrow_tracker.visit_tags(visit);
         data_race.visit_tags(visit);
@@ -467,12 +478,17 @@ pub struct MiriMachine<'mir, 'tcx> {
     pub(crate) gc_interval: u32,
     /// The number of blocks that passed since the last BorTag GC pass.
     pub(crate) since_gc: u32,
+
     /// The number of CPUs to be reported by miri.
     pub(crate) num_cpus: u32,
+
     /// Determines Miri's page size and associated values
     pub(crate) page_size: u64,
     pub(crate) stack_addr: u64,
     pub(crate) stack_size: u64,
+
+    /// Whether to collect a backtrace when each allocation is created, just in case it leaks.
+    pub(crate) collect_leak_backtraces: bool,
 }
 
 impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
@@ -485,9 +501,9 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             measureme::Profiler::new(out).expect("Couldn't create `measureme` profiler")
         });
         let rng = StdRng::seed_from_u64(config.seed.unwrap_or(0));
-        let borrow_tracker = config.borrow_tracker.map(|bt| bt.instanciate_global_state(config));
+        let borrow_tracker = config.borrow_tracker.map(|bt| bt.instantiate_global_state(config));
         let data_race = config.data_race_detector.then(|| data_race::GlobalState::new(config));
-        // Determinine page size, stack address, and stack size.
+        // Determine page size, stack address, and stack size.
         // These values are mostly meaningless, but the stack address is also where we start
         // allocating physical integer addresses for all allocations.
         let page_size = if let Some(page_size) = config.page_size {
@@ -581,6 +597,7 @@ impl<'mir, 'tcx> MiriMachine<'mir, 'tcx> {
             page_size,
             stack_addr,
             stack_size,
+            collect_leak_backtraces: config.collect_leak_backtraces,
         }
     }
 
@@ -728,6 +745,7 @@ impl VisitTags for MiriMachine<'_, '_> {
             page_size: _,
             stack_addr: _,
             stack_size: _,
+            collect_leak_backtraces: _,
         } = self;
 
         threads.visit_tags(visit);
@@ -773,7 +791,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
     type ExtraFnVal = Dlsym;
 
     type FrameExtra = FrameExtra<'tcx>;
-    type AllocExtra = AllocExtra;
+    type AllocExtra = AllocExtra<'tcx>;
 
     type Provenance = Provenance;
     type ProvenanceExtra = ProvenanceExtra;
@@ -834,7 +852,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         ecx.find_mir_or_eval_fn(instance, abi, args, dest, ret, unwind)
     }
@@ -847,7 +865,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        _unwind: StackPopUnwind,
+        _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         ecx.call_dlsym(fn_val, abi, args, dest, ret)
     }
@@ -859,7 +877,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         ecx.call_intrinsic(instance, args, dest, ret, unwind)
     }
@@ -868,7 +886,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
     fn assert_panic(
         ecx: &mut MiriInterpCx<'mir, 'tcx>,
         msg: &mir::AssertMessage<'tcx>,
-        unwind: Option<mir::BasicBlock>,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         ecx.assert_panic(msg, unwind)
     }
@@ -967,9 +985,24 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
             )
         });
         let buffer_alloc = ecx.machine.weak_memory.then(weak_memory::AllocState::new_allocation);
+
+        // If an allocation is leaked, we want to report a backtrace to indicate where it was
+        // allocated. We don't need to record a backtrace for allocations which are allowed to
+        // leak.
+        let backtrace = if kind.may_leak() || !ecx.machine.collect_leak_backtraces {
+            None
+        } else {
+            Some(ecx.generate_stacktrace())
+        };
+
         let alloc: Allocation<Provenance, Self::AllocExtra> = alloc.adjust_from_tcx(
             &ecx.tcx,
-            AllocExtra { borrow_tracker, data_race: race_alloc, weak_memory: buffer_alloc },
+            AllocExtra {
+                borrow_tracker,
+                data_race: race_alloc,
+                weak_memory: buffer_alloc,
+                backtrace,
+            },
             |ptr| ecx.global_base_pointer(ptr),
         )?;
         Ok(Cow::Owned(alloc))
@@ -1049,7 +1082,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
     fn before_memory_read(
         _tcx: TyCtxt<'tcx>,
         machine: &Self,
-        alloc_extra: &AllocExtra,
+        alloc_extra: &AllocExtra<'tcx>,
         (alloc_id, prov_extra): (AllocId, Self::ProvenanceExtra),
         range: AllocRange,
     ) -> InterpResult<'tcx> {
@@ -1069,7 +1102,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
     fn before_memory_write(
         _tcx: TyCtxt<'tcx>,
         machine: &mut Self,
-        alloc_extra: &mut AllocExtra,
+        alloc_extra: &mut AllocExtra<'tcx>,
         (alloc_id, prov_extra): (AllocId, Self::ProvenanceExtra),
         range: AllocRange,
     ) -> InterpResult<'tcx> {
@@ -1089,7 +1122,7 @@ impl<'mir, 'tcx> Machine<'mir, 'tcx> for MiriMachine<'mir, 'tcx> {
     fn before_memory_deallocation(
         _tcx: TyCtxt<'tcx>,
         machine: &mut Self,
-        alloc_extra: &mut AllocExtra,
+        alloc_extra: &mut AllocExtra<'tcx>,
         (alloc_id, prove_extra): (AllocId, Self::ProvenanceExtra),
         range: AllocRange,
     ) -> InterpResult<'tcx> {

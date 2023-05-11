@@ -14,6 +14,7 @@ use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
 use rustc_middle::ty::{suggest_constraining_type_param, Adt, Closure, FnDef, FnPtr, Param, Ty};
 use rustc_middle::ty::{Binder, TraitRef};
+use rustc_middle::util::{call_kind, CallDesugaringKind, CallKind};
 use rustc_session::parse::feature_err;
 use rustc_span::symbol::sym;
 use rustc_span::{BytePos, Pos, Span, Symbol};
@@ -21,7 +22,6 @@ use rustc_trait_selection::traits::SelectionContext;
 
 use super::ConstCx;
 use crate::errors;
-use crate::util::{call_kind, CallDesugaringKind, CallKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -77,7 +77,7 @@ impl<'tcx> NonConstOp<'tcx> for FloatingPointOp {
             &ccx.tcx.sess.parse_sess,
             sym::const_fn_floating_point_arithmetic,
             span,
-            &format!("floating point arithmetic is not allowed in {}s", ccx.const_kind()),
+            format!("floating point arithmetic is not allowed in {}s", ccx.const_kind()),
         )
     }
 }
@@ -184,6 +184,9 @@ impl<'tcx> NonConstOp<'tcx> for FnCallNonConst<'tcx> {
                     CallDesugaringKind::TryBlockFromOutput => {
                         error!("`try` block cannot convert `{}` to the result in {}s")
                     }
+                    CallDesugaringKind::Await => {
+                        error!("cannot convert `{}` into a future in {}s")
+                    }
                 };
 
                 diag_trait(&mut err, self_ty, kind.trait_def_id(tcx));
@@ -208,13 +211,13 @@ impl<'tcx> NonConstOp<'tcx> for FnCallNonConst<'tcx> {
                         err.span_note(span, "function defined here, but it is not `const`");
                     }
                     FnPtr(..) => {
-                        err.note(&format!(
+                        err.note(format!(
                             "function pointers need an RFC before allowed to be called in {}s",
                             ccx.const_kind()
                         ));
                     }
                     Closure(..) => {
-                        err.note(&format!(
+                        err.note(format!(
                             "closures need an RFC before allowed to be called in {}s",
                             ccx.const_kind()
                         ));
@@ -286,7 +289,7 @@ impl<'tcx> NonConstOp<'tcx> for FnCallNonConst<'tcx> {
                     ccx.const_kind()
                 );
 
-                err.note(&format!("attempting to deref into `{}`", deref_target_ty));
+                err.note(format!("attempting to deref into `{}`", deref_target_ty));
 
                 // Check first whether the source is accessible (issue #87060)
                 if tcx.sess.source_map().is_span_accessible(deref_target) {
@@ -296,7 +299,7 @@ impl<'tcx> NonConstOp<'tcx> for FnCallNonConst<'tcx> {
                 diag_trait(&mut err, self_ty, tcx.require_lang_item(LangItem::Deref, Some(span)));
                 err
             }
-            _ if tcx.opt_parent(callee) == tcx.get_diagnostic_item(sym::ArgumentV1Methods) => ccx
+            _ if tcx.opt_parent(callee) == tcx.get_diagnostic_item(sym::ArgumentMethods) => ccx
                 .tcx
                 .sess
                 .create_err(errors::NonConstFmtMacroCall { span, kind: ccx.const_kind() }),
@@ -307,14 +310,14 @@ impl<'tcx> NonConstOp<'tcx> for FnCallNonConst<'tcx> {
             }),
         };
 
-        err.note(&format!(
+        err.note(format!(
             "calls in {}s are limited to constant functions, \
              tuple structs and tuple variants",
             ccx.const_kind(),
         ));
 
         if let Some(feature) = feature && ccx.tcx.sess.is_nightly_build() {
-            err.help(&format!(
+            err.help(format!(
                 "add `#![feature({})]` to the crate attributes to enable",
                 feature,
             ));
@@ -351,7 +354,7 @@ impl<'tcx> NonConstOp<'tcx> for FnCallUnstable {
             err.help("const-stable functions can only call other const-stable functions");
         } else if ccx.tcx.sess.is_nightly_build() {
             if let Some(feature) = feature {
-                err.help(&format!(
+                err.help(format!(
                     "add `#![feature({})]` to the crate attributes to enable",
                     feature
                 ));
@@ -610,10 +613,11 @@ pub struct RawPtrComparison;
 impl<'tcx> NonConstOp<'tcx> for RawPtrComparison {
     fn build_error(
         &self,
-        _: &ConstCx<'_, 'tcx>,
+        ccx: &ConstCx<'_, 'tcx>,
         span: Span,
     ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
-        span_bug!(span, "raw ptr comparison should already be caught in the trait system");
+        // FIXME(const_trait_impl): revert to span_bug?
+        ccx.tcx.sess.create_err(errors::RawPtrComparisonErr { span })
     }
 }
 
@@ -633,7 +637,7 @@ impl<'tcx> NonConstOp<'tcx> for RawMutPtrDeref {
             &ccx.tcx.sess.parse_sess,
             sym::const_mut_refs,
             span,
-            &format!("dereferencing raw mutable pointers in {}s is unstable", ccx.const_kind(),),
+            format!("dereferencing raw mutable pointers in {}s is unstable", ccx.const_kind(),),
         )
     }
 }
@@ -720,7 +724,7 @@ pub mod ty {
                 &ccx.tcx.sess.parse_sess,
                 sym::const_mut_refs,
                 span,
-                &format!("mutable references are not allowed in {}s", ccx.const_kind()),
+                format!("mutable references are not allowed in {}s", ccx.const_kind()),
             )
         }
     }

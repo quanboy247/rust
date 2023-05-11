@@ -257,6 +257,10 @@ parse_invalid_literal_suffix_on_tuple_index = suffixes on a tuple index are inva
     .tuple_exception_line_2 = on proc macros, you'll want to use `syn::Index::from` or `proc_macro::Literal::*_unsuffixed` for code that will desugar to tuple field access
     .tuple_exception_line_3 = see issue #60210 <https://github.com/rust-lang/rust/issues/60210> for more information
 
+parse_expected_builtin_ident = expected identifier after `builtin #`
+
+parse_unknown_builtin_construct = unknown `builtin #` construct `{$name}`
+
 parse_non_string_abi_literal = non-string ABI literal
     .suggestion = specify the ABI with a string literal
 
@@ -339,6 +343,7 @@ parse_expected_identifier = expected identifier
 parse_sugg_escape_identifier = escape `{$ident_name}` to use it as an identifier
 
 parse_sugg_remove_comma = remove this comma
+parse_sugg_add_let_for_stmt = you might have meant to introduce a new binding
 
 parse_expected_semi_found_reserved_identifier_str = expected `;`, found reserved identifier `{$token}`
 parse_expected_semi_found_keyword_str = expected `;`, found keyword `{$token}`
@@ -419,6 +424,15 @@ parse_maybe_fn_typo_with_impl = you might have meant to write `impl` instead of 
 
 parse_expected_fn_path_found_fn_keyword = expected identifier, found keyword `fn`
     .suggestion = use `Fn` to refer to the trait
+
+parse_path_single_colon = path separator must be a double colon
+    .suggestion = use a double colon instead
+
+parse_colon_as_semi = statements are terminated with a semicolon
+    .suggestion = use a semicolon instead
+
+parse_type_ascription_removed =
+    if you meant to annotate an expression with a type, the type ascription syntax has been removed, see issue #101728 <https://github.com/rust-lang/rust/issues/101728>
 
 parse_where_clause_before_tuple_struct_body = where clauses are not allowed before tuple struct bodies
     .label = unexpected where clause
@@ -606,13 +620,6 @@ parse_invalid_dyn_keyword = invalid `dyn` keyword
     .help = `dyn` is only needed at the start of a trait `+`-separated list
     .suggestion = remove this keyword
 
-parse_negative_bounds_not_supported = negative bounds are not supported
-    .label = negative bounds are not supported
-    .suggestion = {$num_bounds ->
-            [one] remove the bound
-           *[other] remove the bounds
-        }
-
 parse_help_set_edition_cargo = set `edition = "{$edition}"` in `Cargo.toml`
 parse_help_set_edition_standalone = pass `--edition {$edition}` to `rustc`
 parse_note_edition_guide = for more on editions, read https://doc.rust-lang.org/edition-guide
@@ -738,3 +745,110 @@ parse_box_syntax_removed = `box_syntax` has been removed
 parse_bad_return_type_notation_output =
     return type not allowed with return type notation
     .suggestion = remove the return type
+
+parse_bad_return_type_notation_dotdot =
+    return type notation uses `()` instead of `(..)` for elided arguments
+    .suggestion = remove the `..`
+
+parse_bad_assoc_type_bounds = bounds on associated types do not belong here
+    .label = belongs in `where` clause
+
+parse_attr_after_generic = trailing attribute after generic parameter
+    .label = attributes must go before parameters
+
+parse_attr_without_generics = attribute without generic parameters
+    .label = attributes are only permitted when preceding parameters
+
+parse_where_generics = generic parameters on `where` clauses are reserved for future use
+    .label = currently unsupported
+
+parse_generics_in_path = unexpected generic arguments in path
+
+parse_assoc_lifetime = associated lifetimes are not supported
+    .label = the lifetime is given here
+    .help = if you meant to specify a trait object, write `dyn Trait + 'lifetime`
+
+parse_tilde_const_lifetime = `~const` may only modify trait bounds, not lifetime bounds
+
+parse_modifier_lifetime = `{$sigil}` may only modify trait bounds, not lifetime bounds
+    .suggestion = remove the `{$sigil}`
+
+parse_parenthesized_lifetime = parenthesized lifetime bounds are not supported
+    .suggestion = remove the parentheses
+
+parse_const_bounds_missing_tilde = const bounds must start with `~`
+    .suggestion = add `~`
+
+parse_underscore_literal_suffix = underscore literal suffix is not allowed
+
+parse_expect_label_found_ident = expected a label, found an identifier
+    .suggestion = labels start with a tick
+
+parse_inappropriate_default = {$article} {$descr} cannot be `default`
+    .label = `default` because of this
+    .note = only associated `fn`, `const`, and `type` items can be `default`
+
+parse_recover_import_as_use = expected item, found {$token_name}
+    .suggestion = items are imported using the `use` keyword
+
+parse_single_colon_import_path = expected `::`, found `:`
+    .suggestion = use double colon
+    .note = import paths are delimited using `::`
+
+parse_bad_item_kind = {$descr} is not supported in {$ctx}
+    .help = consider moving the {$descr} out to a nearby module scope
+
+parse_single_colon_struct_type = found single colon in a struct field type path
+    .suggestion = write a path separator here
+
+parse_equals_struct_default = default values on `struct` fields aren't supported
+    .suggestion = remove this unsupported default value
+
+parse_macro_rules_missing_bang = expected `!` after `macro_rules`
+    .suggestion = add a `!`
+
+parse_macro_name_remove_bang = macro names aren't followed by a `!`
+    .suggestion = remove the `!`
+
+parse_macro_rules_visibility = can't qualify macro_rules invocation with `{$vis}`
+    .suggestion = try exporting the macro
+
+parse_macro_invocation_visibility = can't qualify macro invocation with `pub`
+    .suggestion = remove the visibility
+    .help = try adjusting the macro to put `{$vis}` inside the invocation
+
+parse_nested_adt = `{$kw_str}` definition cannot be nested inside `{$keyword}`
+    .suggestion = consider creating a new `{$kw_str}` definition instead of nesting
+
+parse_function_body_equals_expr = function body cannot be `= expression;`
+    .suggestion = surround the expression with `{"{"}` and `{"}"}` instead of `=` and `;`
+
+parse_box_not_pat = expected pattern, found {$descr}
+    .note = `box` is a reserved keyword
+    .suggestion = escape `box` to use it as an identifier
+
+parse_unmatched_angle = unmatched angle {$plural ->
+    [true] brackets
+    *[false] bracket
+    }
+    .suggestion = remove extra angle {$plural ->
+    [true] brackets
+    *[false] bracket
+    }
+
+parse_missing_plus_in_bounds = expected `+` between lifetime and {$sym}
+    .suggestion = add `+`
+
+parse_incorrect_braces_trait_bounds = incorrect braces around trait bounds
+    .suggestion = remove the parentheses
+
+parse_kw_bad_case = keyword `{$kw}` is written in the wrong case
+    .suggestion = write it in the correct case
+
+parse_meta_bad_delim = wrong meta list delimiters
+parse_cfg_attr_bad_delim = wrong `cfg_attr` delimiters
+parse_meta_bad_delim_suggestion = the delimiters should be `(` and `)`
+
+parse_malformed_cfg_attr = malformed `cfg_attr` attribute input
+    .suggestion = missing condition and attribute
+    .note = for more information, visit <https://doc.rust-lang.org/reference/conditional-compilation.html#the-cfg_attr-attribute>

@@ -20,15 +20,7 @@ fn args(builder: &Builder<'_>) -> Vec<String> {
         arr.iter().copied().map(String::from)
     }
 
-    if let Subcommand::Clippy {
-        fix,
-        clippy_lint_allow,
-        clippy_lint_deny,
-        clippy_lint_warn,
-        clippy_lint_forbid,
-        ..
-    } = &builder.config.cmd
-    {
+    if let Subcommand::Clippy { fix, allow, deny, warn, forbid, .. } = &builder.config.cmd {
         // disable the most spammy clippy lints
         let ignored_lints = vec![
             "many_single_char_names", // there are a lot in stdarch
@@ -53,10 +45,10 @@ fn args(builder: &Builder<'_>) -> Vec<String> {
         args.extend(strings(&["--", "--cap-lints", "warn"]));
         args.extend(ignored_lints.iter().map(|lint| format!("-Aclippy::{}", lint)));
         let mut clippy_lint_levels: Vec<String> = Vec::new();
-        clippy_lint_allow.iter().for_each(|v| clippy_lint_levels.push(format!("-A{}", v)));
-        clippy_lint_deny.iter().for_each(|v| clippy_lint_levels.push(format!("-D{}", v)));
-        clippy_lint_warn.iter().for_each(|v| clippy_lint_levels.push(format!("-W{}", v)));
-        clippy_lint_forbid.iter().for_each(|v| clippy_lint_levels.push(format!("-F{}", v)));
+        allow.iter().for_each(|v| clippy_lint_levels.push(format!("-A{}", v)));
+        deny.iter().for_each(|v| clippy_lint_levels.push(format!("-D{}", v)));
+        warn.iter().for_each(|v| clippy_lint_levels.push(format!("-W{}", v)));
+        forbid.iter().for_each(|v| clippy_lint_levels.push(format!("-F{}", v)));
         args.extend(clippy_lint_levels);
         args.extend(builder.config.free_args.clone());
         args
@@ -79,7 +71,7 @@ impl Step for Std {
     const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.all_krates("test").path("library")
+        run.all_krates("sysroot").path("library")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -105,15 +97,7 @@ impl Step for Std {
             cargo.arg("--lib");
         }
 
-        let msg = if compiler.host == target {
-            format!("Checking stage{} library artifacts ({target})", builder.top_stage)
-        } else {
-            format!(
-                "Checking stage{} library artifacts ({} -> {})",
-                builder.top_stage, &compiler.host, target
-            )
-        };
-        builder.info(&msg);
+        let _guard = builder.msg_check("library artifacts", target);
         run_cargo(
             builder,
             cargo,
@@ -167,18 +151,7 @@ impl Step for Std {
             cargo.arg("-p").arg(krate.name);
         }
 
-        let msg = if compiler.host == target {
-            format!(
-                "Checking stage{} library test/bench/example targets ({target})",
-                builder.top_stage
-            )
-        } else {
-            format!(
-                "Checking stage{} library test/bench/example targets ({} -> {})",
-                builder.top_stage, &compiler.host, target
-            )
-        };
-        builder.info(&msg);
+        let _guard = builder.msg_check("library test/bench/example targets", target);
         run_cargo(
             builder,
             cargo,
@@ -237,7 +210,7 @@ impl Step for Rustc {
             target,
             cargo_subcommand(builder.kind),
         );
-        rustc_cargo(builder, &mut cargo, target);
+        rustc_cargo(builder, &mut cargo, target, compiler.stage);
 
         // For ./x.py clippy, don't run with --all-targets because
         // linting tests and benchmarks can produce very noisy results
@@ -252,15 +225,7 @@ impl Step for Rustc {
             cargo.arg("-p").arg(krate.name);
         }
 
-        let msg = if compiler.host == target {
-            format!("Checking stage{} compiler artifacts ({target})", builder.top_stage)
-        } else {
-            format!(
-                "Checking stage{} compiler artifacts ({} -> {})",
-                builder.top_stage, &compiler.host, target
-            )
-        };
-        builder.info(&msg);
+        let _guard = builder.msg_check("compiler artifacts", target);
         run_cargo(
             builder,
             cargo,
@@ -315,17 +280,9 @@ impl Step for CodegenBackend {
         cargo
             .arg("--manifest-path")
             .arg(builder.src.join(format!("compiler/rustc_codegen_{}/Cargo.toml", backend)));
-        rustc_cargo_env(builder, &mut cargo, target);
+        rustc_cargo_env(builder, &mut cargo, target, compiler.stage);
 
-        let msg = if compiler.host == target {
-            format!("Checking stage{} {} artifacts ({target})", builder.top_stage, backend)
-        } else {
-            format!(
-                "Checking stage{} {} library ({} -> {})",
-                builder.top_stage, backend, &compiler.host.triple, target.triple
-            )
-        };
-        builder.info(&msg);
+        let _guard = builder.msg_check(&backend, target);
 
         run_cargo(
             builder,
@@ -385,15 +342,7 @@ impl Step for RustAnalyzer {
             cargo.arg("--benches");
         }
 
-        let msg = if compiler.host == target {
-            format!("Checking stage{} {} artifacts ({target})", compiler.stage, "rust-analyzer")
-        } else {
-            format!(
-                "Checking stage{} {} artifacts ({} -> {})",
-                compiler.stage, "rust-analyzer", &compiler.host.triple, target.triple
-            )
-        };
-        builder.info(&msg);
+        let _guard = builder.msg_check("rust-analyzer artifacts", target);
         run_cargo(
             builder,
             cargo,
@@ -460,18 +409,7 @@ macro_rules! tool_check_step {
                 // NOTE: this doesn't enable lints for any other tools unless they explicitly add `#![warn(rustc::internal)]`
                 // See https://github.com/rust-lang/rust/pull/80573#issuecomment-754010776
                 cargo.rustflag("-Zunstable-options");
-                let msg = if compiler.host == target {
-                    format!("Checking stage{} {} artifacts ({target})", builder.top_stage, stringify!($name).to_lowercase())
-                } else {
-                    format!(
-                        "Checking stage{} {} artifacts ({} -> {})",
-                        builder.top_stage,
-                        stringify!($name).to_lowercase(),
-                        &compiler.host.triple,
-                        target.triple
-                    )
-                };
-                builder.info(&msg);
+                let _guard = builder.msg_check(&concat!(stringify!($name), " artifacts").to_lowercase(), target);
                 run_cargo(
                     builder,
                     cargo,

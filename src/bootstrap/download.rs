@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{BufRead, BufReader, ErrorKind},
+    io::{BufRead, BufReader, BufWriter, ErrorKind, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -112,7 +112,7 @@ impl Config {
             is_nixos && !Path::new("/lib").exists()
         });
         if val {
-            println!("info: You seem to be using Nix.");
+            eprintln!("info: You seem to be using Nix.");
         }
         val
     }
@@ -226,7 +226,7 @@ impl Config {
         curl.stdout(Stdio::from(f));
         if !self.check_run(&mut curl) {
             if self.build.contains("windows-msvc") {
-                println!("Fallback to PowerShell");
+                eprintln!("Fallback to PowerShell");
                 for _ in 0..3 {
                     if self.try_run(Command::new("PowerShell.exe").args(&[
                         "/nologo",
@@ -239,7 +239,7 @@ impl Config {
                     ])) {
                         return;
                     }
-                    println!("\nspurious failure, trying again");
+                    eprintln!("\nspurious failure, trying again");
                 }
             }
             if !help_on_error.is_empty() {
@@ -250,7 +250,7 @@ impl Config {
     }
 
     fn unpack(&self, tarball: &Path, dst: &Path, pattern: &str) {
-        println!("extracting {} to {}", tarball.display(), dst.display());
+        eprintln!("extracting {} to {}", tarball.display(), dst.display());
         if !dst.exists() {
             t!(fs::create_dir_all(dst));
         }
@@ -262,10 +262,20 @@ impl Config {
         let directory_prefix = Path::new(Path::new(uncompressed_filename).file_stem().unwrap());
 
         // decompress the file
-        let data = t!(File::open(tarball));
+        let data = t!(File::open(tarball), format!("file {} not found", tarball.display()));
         let decompressor = XzDecoder::new(BufReader::new(data));
 
         let mut tar = tar::Archive::new(decompressor);
+
+        // `compile::Sysroot` needs to know the contents of the `rustc-dev` tarball to avoid adding
+        // it to the sysroot unless it was explicitly requested. But parsing the 100 MB tarball is slow.
+        // Cache the entries when we extract it so we only have to read it once.
+        let mut recorded_entries = if dst.ends_with("ci-rustc") && pattern == "rustc-dev" {
+            Some(BufWriter::new(t!(File::create(dst.join(".rustc-dev-contents")))))
+        } else {
+            None
+        };
+
         for member in t!(tar.entries()) {
             let mut member = t!(member);
             let original_path = t!(member.path()).into_owned();
@@ -283,13 +293,19 @@ impl Config {
             if !t!(member.unpack_in(dst)) {
                 panic!("path traversal attack ??");
             }
+            if let Some(record) = &mut recorded_entries {
+                t!(writeln!(record, "{}", short_path.to_str().unwrap()));
+            }
             let src_path = dst.join(original_path);
             if src_path.is_dir() && dst_path.exists() {
                 continue;
             }
             t!(fs::rename(src_path, dst_path));
         }
-        t!(fs::remove_dir_all(dst.join(directory_prefix)));
+        let dst_dir = dst.join(directory_prefix);
+        if dst_dir.exists() {
+            t!(fs::remove_dir_all(&dst_dir), format!("failed to remove {}", dst_dir.display()));
+        }
     }
 
     /// Returns whether the SHA256 checksum of `path` matches `expected`.
@@ -365,28 +381,78 @@ impl Config {
         Some(rustfmt_path)
     }
 
+    pub(crate) fn rustc_dev_contents(&self) -> Vec<String> {
+        assert!(self.download_rustc());
+        let ci_rustc_dir = self.out.join(&*self.build.triple).join("ci-rustc");
+        let rustc_dev_contents_file = t!(File::open(ci_rustc_dir.join(".rustc-dev-contents")));
+        t!(BufReader::new(rustc_dev_contents_file).lines().collect())
+    }
+
     pub(crate) fn download_ci_rustc(&self, commit: &str) {
         self.verbose(&format!("using downloaded stage2 artifacts from CI (commit {commit})"));
+
         let version = self.artifact_version_part(commit);
+        // download-rustc doesn't need its own cargo, it can just use beta's. But it does need the
+        // `rustc_private` crates for tools.
+        let extra_components = ["rustc-dev"];
+
+        self.download_toolchain(
+            &version,
+            "ci-rustc",
+            commit,
+            &extra_components,
+            Self::download_ci_component,
+        );
+    }
+
+    pub(crate) fn download_beta_toolchain(&self) {
+        self.verbose(&format!("downloading stage0 beta artifacts"));
+
+        let date = &self.stage0_metadata.compiler.date;
+        let version = &self.stage0_metadata.compiler.version;
+        let extra_components = ["cargo"];
+
+        let download_beta_component = |config: &Config, filename, prefix: &_, date: &_| {
+            config.download_component(DownloadSource::Dist, filename, prefix, date, "stage0")
+        };
+
+        self.download_toolchain(
+            version,
+            "stage0",
+            date,
+            &extra_components,
+            download_beta_component,
+        );
+    }
+
+    fn download_toolchain(
+        &self,
+        version: &str,
+        sysroot: &str,
+        stamp_key: &str,
+        extra_components: &[&str],
+        download_component: fn(&Config, String, &str, &str),
+    ) {
         let host = self.build.triple;
-        let bin_root = self.out.join(host).join("ci-rustc");
+        let bin_root = self.out.join(host).join(sysroot);
         let rustc_stamp = bin_root.join(".rustc-stamp");
 
-        if !bin_root.join("bin").join("rustc").exists() || program_out_of_date(&rustc_stamp, commit)
+        if !bin_root.join("bin").join(exe("rustc", self.build)).exists()
+            || program_out_of_date(&rustc_stamp, stamp_key)
         {
             if bin_root.exists() {
                 t!(fs::remove_dir_all(&bin_root));
             }
             let filename = format!("rust-std-{version}-{host}.tar.xz");
             let pattern = format!("rust-std-{host}");
-            self.download_ci_component(filename, &pattern, commit);
+            download_component(self, filename, &pattern, stamp_key);
             let filename = format!("rustc-{version}-{host}.tar.xz");
-            self.download_ci_component(filename, "rustc", commit);
-            // download-rustc doesn't need its own cargo, it can just use beta's.
-            let filename = format!("rustc-dev-{version}-{host}.tar.xz");
-            self.download_ci_component(filename, "rustc-dev", commit);
-            let filename = format!("rust-src-{version}.tar.xz");
-            self.download_ci_component(filename, "rust-src", commit);
+            download_component(self, filename, "rustc", stamp_key);
+
+            for component in extra_components {
+                let filename = format!("{component}-{version}-{host}.tar.xz");
+                download_component(self, filename, component, stamp_key);
+            }
 
             if self.should_fix_bins_and_dylibs() {
                 self.fix_bin_or_dylib(&bin_root.join("bin").join("rustc"));
@@ -403,7 +469,7 @@ impl Config {
                 }
             }
 
-            t!(fs::write(rustc_stamp, commit));
+            t!(fs::write(rustc_stamp, stamp_key));
         }
     }
 
@@ -474,7 +540,18 @@ impl Config {
             None
         };
 
-        self.download_file(&format!("{base_url}/{url}"), &tarball, "");
+        let mut help_on_error = "";
+        if destination == "ci-rustc" {
+            help_on_error = "error: failed to download pre-built rustc from CI
+
+note: old builds get deleted after a certain time
+help: if trying to compile an old commit of rustc, disable `download-rustc` in config.toml:
+
+[rust]
+download-rustc = false
+";
+        }
+        self.download_file(&format!("{base_url}/{url}"), &tarball, help_on_error);
         if let Some(sha256) = checksum {
             if !self.verify(&tarball, sha256) {
                 panic!("failed to verify {}", tarball.display());

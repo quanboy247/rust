@@ -691,6 +691,7 @@ impl Write for &TcpStream {
 }
 
 impl AsInner<net_imp::TcpStream> for TcpStream {
+    #[inline]
     fn as_inner(&self) -> &net_imp::TcpStream {
         &self.0
     }
@@ -869,7 +870,7 @@ impl TcpListener {
     /// use std::net::{TcpListener, TcpStream};
     ///
     /// fn listen_on(port: u16) -> impl Iterator<Item = TcpStream> {
-    ///     let listener = TcpListener::bind("127.0.0.1:80").unwrap();
+    ///     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
     ///     listener.into_incoming()
     ///         .filter_map(Result::ok) /* Ignore failed connections */
     /// }
@@ -1033,6 +1034,7 @@ impl Iterator for IntoIncoming {
 impl FusedIterator for IntoIncoming {}
 
 impl AsInner<net_imp::TcpListener> for TcpListener {
+    #[inline]
     fn as_inner(&self) -> &net_imp::TcpListener {
         &self.0
     }

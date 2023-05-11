@@ -392,12 +392,7 @@ impl<'tcx> InferCtxt<'tcx> {
     /// defining scope.
     #[instrument(skip(self), level = "trace", ret)]
     fn opaque_type_origin_unchecked(&self, def_id: LocalDefId) -> OpaqueTyOrigin {
-        match self.tcx.hir().expect_item(def_id).kind {
-            hir::ItemKind::OpaqueTy(hir::OpaqueTy { origin, .. }) => origin,
-            ref itemkind => {
-                bug!("weird opaque type: {:?}, {:#?}", def_id, itemkind)
-            }
-        }
+        self.tcx.hir().expect_item(def_id).expect_opaque_ty().origin
     }
 }
 
@@ -545,7 +540,7 @@ impl<'tcx> InferCtxt<'tcx> {
                 .obligations;
         }
 
-        let item_bounds = tcx.bound_explicit_item_bounds(def_id.to_def_id());
+        let item_bounds = tcx.explicit_item_bounds(def_id);
 
         for (predicate, _) in item_bounds.subst_iter_copied(tcx, substs) {
             let predicate = predicate.fold_with(&mut BottomUpFolder {
@@ -554,6 +549,7 @@ impl<'tcx> InferCtxt<'tcx> {
                     // We can't normalize associated types from `rustc_infer`,
                     // but we can eagerly register inference variables for them.
                     // FIXME(RPITIT): Don't replace RPITITs with inference vars.
+                    // FIXME(inherent_associated_types): Extend this to support `ty::Inherent`, too.
                     ty::Alias(ty::Projection, projection_ty)
                         if !projection_ty.has_escaping_bound_vars()
                             && !tcx.is_impl_trait_in_trait(projection_ty.def_id) =>
@@ -574,6 +570,7 @@ impl<'tcx> InferCtxt<'tcx> {
                         hidden_ty
                     }
                     // FIXME(RPITIT): This can go away when we move to associated types
+                    // FIXME(inherent_associated_types): Extend this to support `ty::Inherent`, too.
                     ty::Alias(
                         ty::Projection,
                         ty::AliasTy { def_id: def_id2, substs: substs2, .. },

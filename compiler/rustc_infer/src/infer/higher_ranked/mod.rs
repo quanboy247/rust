@@ -42,7 +42,7 @@ impl<'a, 'tcx> CombineFields<'a, 'tcx> {
 
         // Next, we instantiate each bound region in the subtype
         // with a fresh region variable. These region variables --
-        // but no other pre-existing region variables -- can name
+        // but no other preexisting region variables -- can name
         // the placeholders.
         let sub_prime = self.infcx.instantiate_binder_with_fresh_vars(span, HigherRankedType, sub);
 
@@ -82,20 +82,20 @@ impl<'tcx> InferCtxt<'tcx> {
 
         let delegate = FnMutDelegate {
             regions: &mut |br: ty::BoundRegion| {
-                self.tcx.mk_re_placeholder(ty::PlaceholderRegion {
-                    universe: next_universe,
-                    name: br.kind,
-                })
+                self.tcx
+                    .mk_re_placeholder(ty::PlaceholderRegion { universe: next_universe, bound: br })
             },
             types: &mut |bound_ty: ty::BoundTy| {
                 self.tcx.mk_placeholder(ty::PlaceholderType {
                     universe: next_universe,
-                    name: bound_ty.kind,
+                    bound: bound_ty,
                 })
             },
             consts: &mut |bound_var: ty::BoundVar, ty| {
-                self.tcx
-                    .mk_const(ty::PlaceholderConst { universe: next_universe, name: bound_var }, ty)
+                self.tcx.mk_const(
+                    ty::PlaceholderConst { universe: next_universe, bound: bound_var },
+                    ty,
+                )
             },
         };
 

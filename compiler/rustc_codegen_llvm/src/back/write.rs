@@ -31,6 +31,7 @@ use rustc_span::symbol::sym;
 use rustc_span::InnerSpan;
 use rustc_target::spec::{CodeModel, RelocModel, SanitizerSet, SplitDebuginfo};
 
+use crate::llvm::diagnostic::OptimizationDiagnosticKind;
 use libc::{c_char, c_int, c_uint, c_void, size_t};
 use std::ffi::CString;
 use std::fs;
@@ -363,6 +364,15 @@ unsafe extern "C" fn diagnostic_handler(info: &DiagnosticInfo, user: *mut c_void
                     line: opt.line,
                     column: opt.column,
                     pass_name: &opt.pass_name,
+                    kind: match opt.kind {
+                        OptimizationDiagnosticKind::OptimizationRemark => "success",
+                        OptimizationDiagnosticKind::OptimizationMissed
+                        | OptimizationDiagnosticKind::OptimizationFailure => "missed",
+                        OptimizationDiagnosticKind::OptimizationAnalysis
+                        | OptimizationDiagnosticKind::OptimizationAnalysisFPCommute
+                        | OptimizationDiagnosticKind::OptimizationAnalysisAliasing => "analysis",
+                        OptimizationDiagnosticKind::OptimizationRemarkOther => "other",
+                    },
                     message: &opt.message,
                 });
             }
@@ -904,9 +914,9 @@ unsafe fn embed_bitcode(
         // We need custom section flags, so emit module-level inline assembly.
         let section_flags = if cgcx.is_pe_coff { "n" } else { "e" };
         let asm = create_section_with_flags_asm(".llvmbc", section_flags, bitcode);
-        llvm::LLVMRustAppendModuleInlineAsm(llmod, asm.as_ptr().cast(), asm.len());
+        llvm::LLVMAppendModuleInlineAsm(llmod, asm.as_ptr().cast(), asm.len());
         let asm = create_section_with_flags_asm(".llvmcmd", section_flags, cmdline.as_bytes());
-        llvm::LLVMRustAppendModuleInlineAsm(llmod, asm.as_ptr().cast(), asm.len());
+        llvm::LLVMAppendModuleInlineAsm(llmod, asm.as_ptr().cast(), asm.len());
     }
 }
 

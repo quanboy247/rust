@@ -12,7 +12,7 @@ use rustc_data_structures::sync::{MappedReadGuard, MappedWriteGuard, ReadGuard, 
 use rustc_expand::base::SyntaxExtension;
 use rustc_hir::def_id::{CrateNum, LocalDefId, StableCrateId, StableCrateIdMap, LOCAL_CRATE};
 use rustc_hir::definitions::Definitions;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{self, CrateType, ExternLocation};
 use rustc_session::cstore::ExternCrateSource;
@@ -27,6 +27,7 @@ use rustc_span::{Span, DUMMY_SP};
 use rustc_target::spec::{PanicStrategy, TargetTriple};
 
 use proc_macro::bridge::client::ProcMacro;
+use std::error::Error;
 use std::ops::Fn;
 use std::path::Path;
 use std::time::Duration;
@@ -185,7 +186,7 @@ impl CStore {
     fn push_dependencies_in_postorder(&self, deps: &mut Vec<CrateNum>, cnum: CrateNum) {
         if !deps.contains(&cnum) {
             let data = self.get_crate_data(cnum);
-            for &dep in data.dependencies().iter() {
+            for dep in data.dependencies() {
                 if dep != cnum {
                     self.push_dependencies_in_postorder(deps, dep);
                 }
@@ -605,7 +606,7 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         if cmeta.update_extern_crate(extern_crate) {
             // Propagate the extern crate info to dependencies if it was updated.
             let extern_crate = ExternCrate { dependency_of: cnum, ..extern_crate };
-            for &dep_cnum in cmeta.dependencies().iter() {
+            for dep_cnum in cmeta.dependencies() {
                 self.update_extern_crate(dep_cnum, extern_crate);
             }
         }
@@ -864,6 +865,17 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
         }
     }
 
+    fn inject_forced_externs(&mut self) {
+        for (name, entry) in self.sess.opts.externs.iter() {
+            if entry.force {
+                let name_interned = Symbol::intern(name);
+                if !self.used_extern_options.contains(&name_interned) {
+                    self.resolve_crate(name_interned, DUMMY_SP, CrateDepKind::Explicit);
+                }
+            }
+        }
+    }
+
     fn inject_dependency_if(
         &self,
         krate: CrateNum,
@@ -912,7 +924,7 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
                 // Don't worry about pathless `--extern foo` sysroot references
                 continue;
             }
-            if entry.nounused_dep {
+            if entry.nounused_dep || entry.force {
                 // We're not worried about this one
                 continue;
             }
@@ -941,6 +953,7 @@ impl<'a, 'tcx> CrateLoader<'a, 'tcx> {
     }
 
     pub fn postprocess(&mut self, krate: &ast::Crate) {
+        self.inject_forced_externs();
         self.inject_profiler_runtime(krate);
         self.inject_allocator_crate(krate);
         self.inject_panic_runtime(krate);
@@ -1094,5 +1107,12 @@ fn load_dylib(path: &Path, max_attempts: usize) -> Result<libloading::Library, S
     }
 
     debug!("Failed to load proc-macro `{}` even after {} attempts.", path.display(), max_attempts);
-    Err(format!("{} (retried {} times)", last_error.unwrap(), max_attempts))
+
+    let last_error = last_error.unwrap();
+    let message = if let Some(src) = last_error.source() {
+        format!("{last_error} ({src}) (retried {max_attempts} times)")
+    } else {
+        format!("{last_error} (retried {max_attempts} times)")
+    };
+    Err(message)
 }
